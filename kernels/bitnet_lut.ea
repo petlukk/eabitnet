@@ -38,3 +38,44 @@ export func prepare_lut_weights(
         col = col + 1
     }
 }
+
+// Scalar fallback for rows not divisible by 16.
+// Takes row-major packed weights (NOT column-interleaved).
+// n_cols must be divisible by 4.
+export func lut_matmul_tail(
+    weights: *restrict u8,
+    activations: *restrict i8,
+    out scores: *mut i32 [cap: n_rows],
+    n_rows: i32,
+    n_cols: i32
+) {
+    let stride: i32 = n_cols / 4
+
+    let mut row: i32 = 0
+    while row < n_rows {
+        let mut sum: i32 = 0
+        let mut col: i32 = 0
+        while col < stride {
+            let packed: u8 = weights[row * stride + col]
+            let act_base: i32 = col * 4
+
+            let w0: i32 = to_i32((packed / 64) % 4)
+            let w1: i32 = to_i32((packed / 16) % 4)
+            let w2: i32 = to_i32((packed / 4) % 4)
+            let w3: i32 = to_i32(packed % 4)
+
+            // activations is *i8, so to_i32 sign-extends correctly
+            let a0: i32 = to_i32(activations[act_base])
+            let a1: i32 = to_i32(activations[act_base + 1])
+            let a2: i32 = to_i32(activations[act_base + 2])
+            let a3: i32 = to_i32(activations[act_base + 3])
+
+            // ternary: 0→-1, 1→0, 2→+1
+            sum = sum + (w0 - 1) * a0 + (w1 - 1) * a1 + (w2 - 1) * a2 + (w3 - 1) * a3
+
+            col = col + 1
+        }
+        scores[row] = sum
+        row = row + 1
+    }
+}
