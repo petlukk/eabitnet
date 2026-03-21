@@ -1,0 +1,40 @@
+// bitnet_lut.ea — LUT-based ternary matmul via shuffle_bytes
+//
+// Cross-platform (x86 SSSE3 + ARM NEON). No #[cfg] needed.
+//
+// Three functions:
+// 1. prepare_lut_weights: transpose row-major packed bytes to column-interleaved
+// 2. lut_matmul: SIMD matmul processing 16 rows in parallel via shuffle_bytes
+// 3. lut_matmul_tail: scalar fallback for remainder rows (< 16)
+
+// Transpose packed weight bytes from row-major to column-interleaved format.
+// Column-interleaved: 16 consecutive bytes = same column from 16 consecutive rows.
+// This enables contiguous vector loads in lut_matmul.
+// n_rows must be divisible by 16. n_cols must be divisible by 4.
+export func prepare_lut_weights(
+    src: *restrict u8,
+    out dst: *mut u8 [cap: n_rows * n_cols / 4],
+    n_rows: i32,
+    n_cols: i32
+) {
+    let stride: i32 = n_cols / 4
+    let n_groups: i32 = n_rows / 16
+
+    let mut col: i32 = 0
+    while col < stride {
+        let mut g: i32 = 0
+        while g < n_groups {
+            let out_base: i32 = col * n_rows + g * 16
+            let row_base: i32 = g * 16
+
+            let mut r: i32 = 0
+            while r < 16 {
+                dst[out_base + r] = src[(row_base + r) * stride + col]
+                r = r + 1
+            }
+
+            g = g + 1
+        }
+        col = col + 1
+    }
+}
