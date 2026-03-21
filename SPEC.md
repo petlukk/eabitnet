@@ -18,11 +18,11 @@ with portable `.ea` kernels. Part of the Eä ecosystem alongside eakv
 │    │     ├── bitnet_i2s.ea        ✅ done   │
 │    │     ├── bitnet_quant.ea      ✅ done   │
 │    │     ├── bitnet_i2s_arm.ea    ✅ done   │
-│    │     └── bitnet_lut.ea        🔲 lut    │
+│    │     └── bitnet_lut.ea        ✅ done   │
 │    └── eakv (KV cache)            ✅ exists │
 ├─────────────────────────────────────────────┤
 │  eacompute (compiler)             ✅ exists │
-│    ├── shuffle_bytes intrinsic    🔲 lut    │
+│    ├── shuffle_bytes intrinsic    ✅ done   │
 │    └── vdot_i32 intrinsic         ✅ done   │
 └─────────────────────────────────────────────┘
 ```
@@ -46,16 +46,16 @@ token in
 | `bitnet_i2s.ea` | `i2_dot_i8`, `i2_dot_i8_4row` | 12/12 | Done (x86) |
 | `bitnet_quant.ea` | `quant_f32_i8`, `pack_ternary_row` | 13/13 | Done (x86) |
 | `bitnet_i2s_arm.ea` | `i2_dot_i8`, `i2_dot_i8_4row` | 12/12 | Done (aarch64, Pi 5) |
-| `bitnet_lut.ea` | LUT-based ternary matmul | — | Needs `shuffle_bytes` intrinsic |
+| `bitnet_lut.ea` | `prepare_lut_weights`, `lut_matmul`, `lut_matmul_tail` | 15/15 | Done (cross-platform) |
 
 ## Remaining work
 
 ### Kernels
 
-- **`bitnet_lut.ea`** — LUT-based ternary matmul (x86 + ARM).
-  Replaces BitNet's TL1/TL2 preset kernel headers (thousands of generated lines).
-  Uses `shuffle_bytes` for 16-entry byte lookup instead of multiplication.
-  Blocked on: `shuffle_bytes` intrinsic in eacompute.
+- ~~**`bitnet_lut.ea`**~~ ✅ Done.
+  LUT-based ternary matmul (cross-platform x86 + ARM). Processes 16 weight
+  rows in parallel via `shuffle_bytes`. 15/15 tests passing, ~3.1 Gop/s.
+  `prepare_lut_weights` transposes to column-interleaved layout at model load.
 
 - ~~**`bitnet_i2s_arm.ea`**~~ ✅ Done.
   ARM NEON path for the I2_S dot product. Uses `vdot_i32` (signed×signed).
@@ -63,15 +63,11 @@ token in
 
 ### Compiler (eacompute)
 
-- **`shuffle_bytes(u8x16, u8x16) -> u8x16`** — runtime byte lookup.
-  Maps to `vpshufb` (x86) / `tbl` (ARM). Not the same as `shuffle` which is
-  compile-time lane permutation. This is data-driven: indices come from weights.
+- ~~**`shuffle_bytes(u8x16, u8x16) -> u8x16`**~~ ✅ Done.
+  Runtime byte lookup. Maps to `vpshufb` (x86) / `tbl` (ARM).
 
 - ~~**`vdot_i32(i8x16, i8x16) -> i32x4`**~~ ✅ Done.
   ARM NEON signed dot product. Maps to `vdotq_s32` (ARMv8.2+).
-  ARM-only, errors on x86. Gated behind `--dotprod` flag.
-  Not an alias for `maddubs_i32` — different signedness (signed×signed
-  vs unsigned×signed) and no intermediate saturation step.
 
 ### Integration
 
