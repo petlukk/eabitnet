@@ -60,6 +60,14 @@ extern "C" {
     );
 }
 
+#[link(name = "bitnet_fused_attn")]
+extern "C" {
+    pub fn fused_attention_f32(
+        q: *const f32, k_cache: *const f32, v_cache: *const f32,
+        out: *mut f32, head_dim: i32, seq_len: i32, scale: f32,
+    );
+}
+
 #[link(name = "bitnet_activate")]
 extern "C" {
     pub fn squared_relu_mul_f32(gate: *const f32, up: *const f32, out: *mut f32, n: i32);

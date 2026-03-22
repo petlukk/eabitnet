@@ -12,7 +12,6 @@ pub struct InferenceState {
     v: Vec<f32>,
     attn_out: Vec<f32>,
     attn_out_quant: Vec<i8>,
-    scores: Vec<f32>,
     gate: Vec<f32>,
     up: Vec<f32>,
     hidden: Vec<f32>,
@@ -239,7 +238,6 @@ impl InferenceState {
             v: vec![0.0; model.kv_dim],
             attn_out: vec![0.0; h],
             attn_out_quant: vec![0; h + 12],
-            scores: vec![0.0; max_seq_len],
             gate: vec![0.0; f],
             up: vec![0.0; f],
             hidden: vec![0.0; f],
@@ -302,26 +300,19 @@ impl InferenceState {
                 self.v_cache[off..off + hd]
                     .copy_from_slice(&self.v[head * hd..(head + 1) * hd]);
             }
+            // Fused attention: single-pass score + online softmax + V accumulate
             let scale = 1.0 / (hd as f32).sqrt();
             for head in 0..nh {
                 let kv_head = head / gqa_ratio;
                 let q_off = head * hd;
                 let cache_base = (layer * nkv + kv_head) * self.max_seq_len * hd;
                 unsafe {
-                    ffi::attn_scores_f32(
+                    ffi::fused_attention_f32(
                         self.q.as_ptr().add(q_off),
                         self.k_cache.as_ptr().add(cache_base),
-                        self.scores.as_mut_ptr(),
-                        hd as i32, seq_len as i32, scale,
-                    );
-                    ffi::softmax_f32(
-                        self.scores.as_ptr(), self.scores.as_mut_ptr(), seq_len as i32,
-                    );
-                    ffi::attn_weighted_sum_f32(
-                        self.scores.as_ptr(),
                         self.v_cache.as_ptr().add(cache_base),
                         self.attn_out.as_mut_ptr().add(q_off),
-                        hd as i32, seq_len as i32,
+                        hd as i32, seq_len as i32, scale,
                     );
                 }
             }
