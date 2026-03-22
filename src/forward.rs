@@ -1,7 +1,7 @@
 //! Transformer forward pass for BitNet b1.58 2B-4T.
 
 use crate::ffi;
-use crate::matmul::{embed_f16_lookup, f32_matmul_mt, ternary_matmul_mt, ternary_matmul_parallel_pair};
+use crate::matmul::{embed_f16_lookup, f32_matmul_mt, ternary_matmul_mt, ternary_matmul_parallel_pair, ternary_matmul_qkv};
 use crate::model::BitNetModel;
 
 pub struct InferenceState {
@@ -127,16 +127,11 @@ impl InferenceState {
                 );
             }
             let s = tick!();
-            ternary_matmul_mt(
-                lw.wq, self.x_quant.as_ptr(), act_scale, act_sum, lw.wq_scale,
-                &mut self.q, h, h,
-            );
-            ternary_matmul_parallel_pair(
-                lw.wk, lw.wk_scale,
-                lw.wv, lw.wv_scale,
-                self.x_quant.as_ptr(), act_scale, act_sum,
-                &mut self.k, &mut self.v,
-                kv, h,
+            ternary_matmul_qkv(
+                lw.wq, lw.wq_scale, &mut self.q, h,
+                lw.wk, lw.wk_scale, &mut self.k, kv,
+                lw.wv, lw.wv_scale, &mut self.v,
+                self.x_quant.as_ptr(), act_scale, act_sum, h,
             );
             tock!(t_qkv, s);
             build_rope_freqs(&mut self.rope_freqs, hd, pos, model.rope_theta);

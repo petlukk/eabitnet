@@ -207,6 +207,43 @@ pub(crate) fn ternary_matmul_mt(
     ternary_matmul_mt_n(weight, act, act_scale, act_sum, weight_scale, out, out_dim, in_dim, n_threads);
 }
 
+/// Run Q + K + V concurrently: Q gets half threads, K and V split the other half.
+pub(crate) fn ternary_matmul_qkv(
+    w_q: *const u8, scale_q: f32, out_q: &mut [f32], out_dim_q: usize,
+    w_k: *const u8, scale_k: f32, out_k: &mut [f32], out_dim_kv: usize,
+    w_v: *const u8, scale_v: f32, out_v: &mut [f32],
+    act: *const i8, act_scale: f32, act_sum: i32, in_dim: usize,
+) {
+    let total = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let q_threads = (total / 2).max(1);
+    let kv_threads = (total - q_threads).max(1);
+    let k_threads = (kv_threads / 2).max(1);
+    let v_threads = (kv_threads - k_threads).max(1);
+
+    let q_ptr = out_q.as_mut_ptr() as usize;
+    let k_ptr = out_k.as_mut_ptr() as usize;
+    let v_ptr = out_v.as_mut_ptr() as usize;
+    let act_ptr = act as usize;
+    let wq = w_q as usize;
+    let wk = w_k as usize;
+    let wv = w_v as usize;
+
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let out = unsafe { std::slice::from_raw_parts_mut(q_ptr as *mut f32, out_dim_q) };
+            ternary_matmul_mt_n(wq as _, act_ptr as _, act_scale, act_sum, scale_q, out, out_dim_q, in_dim, q_threads);
+        });
+        s.spawn(|| {
+            let out = unsafe { std::slice::from_raw_parts_mut(k_ptr as *mut f32, out_dim_kv) };
+            ternary_matmul_mt_n(wk as _, act_ptr as _, act_scale, act_sum, scale_k, out, out_dim_kv, in_dim, k_threads);
+        });
+        s.spawn(|| {
+            let out = unsafe { std::slice::from_raw_parts_mut(v_ptr as *mut f32, out_dim_kv) };
+            ternary_matmul_mt_n(wv as _, act_ptr as _, act_scale, act_sum, scale_v, out, out_dim_kv, in_dim, v_threads);
+        });
+    });
+}
+
 /// Run two ternary matmuls concurrently, splitting threads between them.
 pub(crate) fn ternary_matmul_parallel_pair(
     w_a: *const u8, scale_a: f32,
