@@ -109,6 +109,21 @@ curl -L "https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf/resolve/main/g
   -o ~/.eabitnet/models/ggml-model-i2_s.gguf
 ```
 
+## Model quality
+
+BitNet b1.58 2B-4T is a **2 billion parameter** model with **1-bit weights**. It's small and fast, not smart. Set your expectations accordingly:
+
+| Works well | Don't expect |
+|---|---|
+| Factual recall ("capital of France") | Math ("what is 6+6") |
+| Code completion (`def fibonacci(n):`) | Complex reasoning |
+| Text continuation | Long coherent essays |
+| Pattern matching | Following instructions |
+
+Greedy decoding (temperature=0) tends to repeat after 20-30 tokens. This is normal for small models without top-p/top-k sampling.
+
+The point of eabitnet is proving the **inference engine**, not the model. If you want better answers, wait for larger BitNet models and drop them in — the runner handles any BitNet GGUF.
+
 ## CLI
 
 ```
