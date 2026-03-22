@@ -1,0 +1,62 @@
+// bitnet_i8dot.ea — Tiled i8 dot product for quantized output projection
+//
+// Computes out[r] = dot(act_i8, weight_u8[r]) for 4 rows simultaneously.
+// Uses maddubs_i32 (u8 × i8 → i32x4) for SIMD accumulation.
+// weight is stored as u8 (bias +128 applied during quantization).
+// Caller corrects for bias and applies per-row scales after.
+//
+// dot(act_i8, weight_u8) = dot(act, orig + 128) = dot(act, orig) + 128 * sum(act)
+// So: true_dot = raw_dot - 128 * act_sum
+// Final: result_f32 = (true_dot) * act_scale * row_scale / (127 * 127)
+
+#[cfg(x86_64)]
+
+export func i8dot_4row(
+    act: *restrict i8,
+    w0: *restrict u8,
+    w1: *restrict u8,
+    w2: *restrict u8,
+    w3: *restrict u8,
+    out scores: *mut i32 [cap: 4],
+    n: i32
+) {
+    let mut r0: i32x4 = splat(0)
+    let mut r1: i32x4 = splat(0)
+    let mut r2: i32x4 = splat(0)
+    let mut r3: i32x4 = splat(0)
+
+    let mut i: i32 = 0
+    while i + 16 <= n {
+        let a: i8x16 = load(act, i)
+        let v0: u8x16 = load(w0, i)
+        let v1: u8x16 = load(w1, i)
+        let v2: u8x16 = load(w2, i)
+        let v3: u8x16 = load(w3, i)
+        r0 = r0 .+ maddubs_i32(v0, a)
+        r1 = r1 .+ maddubs_i32(v1, a)
+        r2 = r2 .+ maddubs_i32(v2, a)
+        r3 = r3 .+ maddubs_i32(v3, a)
+        i = i + 16
+    }
+
+    scores[0] = reduce_add(r0)
+    scores[1] = reduce_add(r1)
+    scores[2] = reduce_add(r2)
+    scores[3] = reduce_add(r3)
+}
+
+export func i8dot_1row(
+    act: *restrict i8,
+    w: *restrict u8,
+    n: i32
+) -> i32 {
+    let mut acc: i32x4 = splat(0)
+    let mut i: i32 = 0
+    while i + 16 <= n {
+        let wv: u8x16 = load(w, i)
+        let av: i8x16 = load(act, i)
+        acc = acc .+ maddubs_i32(wv, av)
+        i = i + 16
+    }
+    return reduce_add(acc)
+}

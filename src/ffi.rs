@@ -68,6 +68,15 @@ extern "C" {
     );
 }
 
+#[link(name = "bitnet_i8dot")]
+extern "C" {
+    pub fn i8dot_1row(act: *const i8, w: *const u8, n: i32) -> i32;
+    pub fn i8dot_4row(
+        act: *const i8, w0: *const u8, w1: *const u8, w2: *const u8, w3: *const u8,
+        scores: *mut i32, n: i32,
+    );
+}
+
 #[link(name = "bitnet_output")]
 extern "C" {
     pub fn tiled_dot_4row(

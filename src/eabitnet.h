@@ -54,6 +54,11 @@ void squared_relu_mul_f32(const float *gate, const float *up, float *out, int32_
 void fused_attention_f32(const float *q, const float *k_cache, const float *v_cache,
                          float *out, int32_t head_dim, int32_t seq_len, float scale);
 
+// i8 dot product for quantized output projection (u8 weights × i8 activations)
+int32_t i8dot_1row(const int8_t *act, const uint8_t *w, int32_t n);
+void i8dot_4row(const int8_t *act, const uint8_t *w0, const uint8_t *w1,
+                const uint8_t *w2, const uint8_t *w3, int32_t *scores, int32_t n);
+
 // Tiled 4-row f32 dot product for output projection
 void tiled_dot_4row(const float *x, const float *rows, float *out,
                     int32_t dim, int32_t n_rows);

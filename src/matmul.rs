@@ -39,6 +39,83 @@ pub(crate) fn embed_f16_lookup(embed: *const u8, token: u32, out: &mut [f32], hi
     }
 }
 
+/// i8 output matmul: quantize x to i8, then i8×u8 dot product for each vocab row.
+/// embed_i8 is u8 (i8 + 128 bias), row_scales is per-row absmax.
+pub(crate) fn i8_output_matmul_mt(
+    embed_i8: &[u8], row_scales: &[f32],
+    x: &[f32], out: &mut [f32],
+    vocab_size: usize, hidden_dim: usize,
+) {
+    use std::thread;
+    let n_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+
+    // Quantize x to i8 (absmax)
+    let mut x_amax = 0.0f32;
+    for &v in x.iter().take(hidden_dim) {
+        let a = v.abs();
+        if a > x_amax { x_amax = a; }
+    }
+    let x_inv = if x_amax > 1e-10 { 127.0 / x_amax } else { 0.0 };
+    let mut x_i8 = vec![0i8; hidden_dim];
+    let mut x_sum: i32 = 0;
+    for d in 0..hidden_dim {
+        let q = (x[d] * x_inv).round().clamp(-127.0, 127.0) as i8;
+        x_i8[d] = q;
+        x_sum += q as i32;
+    }
+
+    let chunk = ((vocab_size + n_threads - 1) / n_threads + 3) & !3;
+    let embed_ptr = embed_i8.as_ptr() as usize;
+    let scales_ptr = row_scales.as_ptr() as usize;
+    let act_ptr = x_i8.as_ptr() as usize;
+    let out_ptr = out.as_mut_ptr() as usize;
+    let x_scale = x_amax / 127.0;
+
+    thread::scope(|s| {
+        for t in 0..n_threads {
+            let start = t * chunk;
+            let end = (start + chunk).min(vocab_size);
+            if start >= end { continue; }
+            let count = end - start;
+            s.spawn(move || {
+                let embed = embed_ptr as *const u8;
+                let scales = scales_ptr as *const f32;
+                let act = act_ptr as *const i8;
+                let out = unsafe { std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(start), count) };
+                let h = hidden_dim;
+                let mut raw = vec![0i32; 4];
+                let mut r = 0;
+                while r + 4 <= count {
+                    let row = start + r;
+                    unsafe {
+                        ffi::i8dot_4row(
+                            act,
+                            embed.add(row * h), embed.add((row+1) * h),
+                            embed.add((row+2) * h), embed.add((row+3) * h),
+                            raw.as_mut_ptr(), h as i32,
+                        );
+                    }
+                    for j in 0..4 {
+                        let row_s = unsafe { *scales.add(row + j) };
+                        let corrected = raw[j] - 128 * x_sum;
+                        out[r + j] = corrected as f32 * x_scale * (row_s / 127.0);
+                    }
+                    r += 4;
+                }
+                while r < count {
+                    let row = start + r;
+                    let raw_val = unsafe { ffi::i8dot_1row(act, embed.add(row * h), h as i32) };
+                    let row_s = unsafe { *scales.add(row) };
+                    let corrected = raw_val - 128 * x_sum;
+                    out[r] = corrected as f32 * x_scale * (row_s / 127.0);
+                    r += 1;
+                }
+            });
+        }
+    });
+}
+
+#[allow(dead_code)]
 pub(crate) fn f32_matmul_mt(
     embed: &[f32], x: &[f32], out: &mut [f32], vocab_size: usize, hidden_dim: usize,
 ) {

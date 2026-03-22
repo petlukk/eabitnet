@@ -17,6 +17,8 @@ pub struct BitNetModel {
     pub layers: Vec<LayerWeights>,
     pub embed_weight_f16: *const u8,
     pub embed_weight_f32: Vec<f32>,
+    pub embed_weight_i8: Vec<u8>,       // per-row quantized (u8 = i8 + 128 bias)
+    pub embed_row_scales: Vec<f32>,     // per-row absmax scale
     pub norm_weight: *const f32,
     /// Owned repacked I2_S weight data (keeps pointers valid)
     _weight_data: Vec<Vec<u8>>,
@@ -174,7 +176,31 @@ impl BitNetModel {
             };
             embed_weight_f32.push(f);
         }
-        eprintln!("  F16→F32 embedding: {} floats ({:.1} MB)", n_f16, n_f16 as f64 * 4.0 / 1e6);
+        // Quantize embedding rows to i8 (per-row absmax) + u8 bias for output projection
+        let mut embed_weight_i8 = Vec::with_capacity(n_f16);
+        let mut embed_row_scales = Vec::with_capacity(vocab_size);
+        for row in 0..vocab_size {
+            let base = row * hidden_dim;
+            let mut amax = 0.0f32;
+            for d in 0..hidden_dim {
+                let v = embed_weight_f32[base + d].abs();
+                if v > amax { amax = v; }
+            }
+            embed_row_scales.push(amax);
+            if amax < 1e-10 {
+                for _ in 0..hidden_dim { embed_weight_i8.push(128u8); } // zero → 128 (bias)
+            } else {
+                let inv = 127.0 / amax;
+                for d in 0..hidden_dim {
+                    let q = (embed_weight_f32[base + d] * inv).round().clamp(-127.0, 127.0) as i8;
+                    embed_weight_i8.push((q as i16 + 128) as u8);
+                }
+            }
+        }
+        eprintln!("  Embedding: {} vocab × {} dim, f32 ({:.0} MB) + i8 ({:.0} MB)",
+            vocab_size, hidden_dim,
+            n_f16 as f64 * 4.0 / 1e6,
+            embed_weight_i8.len() as f64 / 1e6);
 
         let mut layers = Vec::with_capacity(n_layers);
         let mut weight_data: Vec<Vec<u8>> = Vec::new();
@@ -212,6 +238,8 @@ impl BitNetModel {
             layers,
             embed_weight_f16,
             embed_weight_f32,
+            embed_weight_i8,
+            embed_row_scales,
             norm_weight,
             _weight_data: weight_data,
         })

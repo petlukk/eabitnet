@@ -23,6 +23,7 @@ test: kernels
 	$(CC) $(CFLAGS) tests/test_activate.c -L$(LIB) -lbitnet_activate -o $(BUILD)/test_activate -lm
 	$(CC) $(CFLAGS) tests/test_fused_attn.c -L$(LIB) -lbitnet_fused_attn -o $(BUILD)/test_fused_attn -lm
 	$(CC) $(CFLAGS) tests/test_output.c -L$(LIB) -lbitnet_output -o $(BUILD)/test_output -lm
+	$(CC) $(CFLAGS) tests/test_i8dot.c -L$(LIB) -lbitnet_i8dot -o $(BUILD)/test_i8dot -lm
 	LD_LIBRARY_PATH=$(LIB) $(BUILD)/test_i2s
 	LD_LIBRARY_PATH=$(LIB) $(BUILD)/test_quant
 	LD_LIBRARY_PATH=$(LIB) $(BUILD)/test_lut
@@ -34,6 +35,7 @@ test: kernels
 	LD_LIBRARY_PATH=$(LIB) $(BUILD)/test_activate
 	LD_LIBRARY_PATH=$(LIB) $(BUILD)/test_fused_attn
 	LD_LIBRARY_PATH=$(LIB) $(BUILD)/test_output
+	LD_LIBRARY_PATH=$(LIB) $(BUILD)/test_i8dot
 
 clean:
 	rm -rf $(BUILD)
