@@ -27,6 +27,9 @@ void quant_f32_i8(const float *src, int8_t *dst, float *out_scale, int32_t *out_
 // Pack ternary values {0,1,2} into 2-bit packed bytes
 void pack_ternary_row(const uint8_t *ternary, uint8_t *packed, int32_t n);
 
+// Element-wise f32 vector addition (residual connections)
+void vecadd_f32(const float *a, const float *b, float *out, int32_t n);
+
 #ifdef __cplusplus
 }
 #endif

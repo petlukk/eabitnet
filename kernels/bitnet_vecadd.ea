@@ -1,0 +1,17 @@
+// bitnet_vecadd.ea — Element-wise f32 vector addition for residual connections
+
+#[cfg(x86_64)]
+
+export func vecadd_f32(a: *restrict f32, b: *restrict f32, out: *mut f32, n: i32) {
+    let mut i: i32 = 0
+    while i + 8 <= n {
+        let va: f32x8 = load(a, i)
+        let vb: f32x8 = load(b, i)
+        store(out, i, va .+ vb)
+        i = i + 8
+    }
+    while i < n {
+        out[i] = a[i] + b[i]
+        i = i + 1
+    }
+}
