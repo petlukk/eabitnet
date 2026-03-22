@@ -1,5 +1,6 @@
 mod ffi;
 mod gguf;
+mod model;
 mod tokenizer;
 
 fn main() {
