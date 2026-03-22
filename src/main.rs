@@ -84,8 +84,8 @@ fn main() {
     tokens.extend(tokenizer.encode(prompt_text));
     eprintln!("Prompt: {} tokens", tokens.len());
 
-    let output = InferenceState::generate(
-        &model, &tokens, max_tokens, temperature, tokenizer.eos_id, max_seq_len,
+    let (output, _prefill_ms, _decode_ms) = InferenceState::generate(
+        &model, &tokens, max_tokens, temperature, tokenizer.eos_id, max_seq_len, true,
     );
 
     let generated = &output[tokens.len()..];

@@ -139,7 +139,10 @@ impl Tokenizer {
                 bytes.extend_from_slice(&self.vocab[id as usize]);
             }
         }
-        String::from_utf8_lossy(&bytes).into_owned()
+        String::from_utf8_lossy(&bytes)
+            .replace('\u{0120}', " ")
+            .replace('\u{2581}', " ")
+            .replace('\u{010A}', "\n")
     }
 }
 

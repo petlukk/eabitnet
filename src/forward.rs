@@ -397,16 +397,22 @@ impl InferenceState {
         temperature: f32,
         eos_id: u32,
         max_seq_len: usize,
-    ) -> Vec<u32> {
+        stream: bool,
+    ) -> (Vec<u32>, f64, f64) {
+        use std::time::Instant;
         let mut state = InferenceState::new(model, max_seq_len);
         let mut output = Vec::with_capacity(prompt_tokens.len() + max_tokens);
 
+        let prefill_start = Instant::now();
         for (i, &tok) in prompt_tokens.iter().enumerate() {
             state.forward(model, tok, i);
             output.push(tok);
         }
+        let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
+        let decode_start = Instant::now();
         let mut pos = prompt_tokens.len();
+        let mut n_gen = 0u32;
         for _ in 0..max_tokens {
             if pos >= max_seq_len {
                 break;
@@ -416,10 +422,22 @@ impl InferenceState {
                 break;
             }
             output.push(next);
+            if stream {
+                // Caller handles streaming — we just track count
+            }
             state.forward(model, next, pos);
             pos += 1;
+            n_gen += 1;
         }
+        let decode_ms = decode_start.elapsed().as_secs_f64() * 1000.0;
 
-        output
+        let prefill_tps = prompt_tokens.len() as f64 / (prefill_ms / 1000.0);
+        let decode_tps = if n_gen > 0 { n_gen as f64 / (decode_ms / 1000.0) } else { 0.0 };
+
+        eprintln!("\n--- perf ---");
+        eprintln!("prefill: {} tokens in {:.0}ms ({:.1} tok/s)", prompt_tokens.len(), prefill_ms, prefill_tps);
+        eprintln!("decode:  {} tokens in {:.0}ms ({:.1} tok/s)", n_gen, decode_ms, decode_tps);
+
+        (output, prefill_ms, decode_ms)
     }
 }
