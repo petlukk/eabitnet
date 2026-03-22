@@ -33,6 +33,9 @@ void vecadd_f32(const float *a, const float *b, float *out, int32_t n);
 // RMSNorm: out[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
 void rmsnorm_f32(const float *x, const float *weight, float *out, int32_t n, float eps);
 
+// Softmax: numerically stable, fast exp polynomial
+void softmax_f32(const float *x, float *out, int32_t n);
+
 #ifdef __cplusplus
 }
 #endif

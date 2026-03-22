@@ -1,0 +1,85 @@
+// bitnet_softmax.ea — Numerically stable softmax
+//
+// Pass 1: find max (dual f32x8)
+// Pass 2: exp(x - max), accumulate sum
+// Pass 3: divide by sum
+
+#[cfg(x86_64)]
+
+export func softmax_f32(x: *restrict f32, out: *mut f32, n: i32) {
+    // Pass 1: find max
+    let mut mx: f32 = x[0]
+    let mut i: i32 = 1
+    while i < n {
+        if x[i] > mx { mx = x[i] }
+        i = i + 1
+    }
+
+    // SIMD max refinement for large n
+    if n >= 16 {
+        let mut mx0: f32x8 = load(x, 0)
+        let mut mx1: f32x8 = load(x, 8)
+        i = 16
+        while i + 16 <= n {
+            let v0: f32x8 = load(x, i)
+            let v1: f32x8 = load(x, i + 8)
+            mx0 = select(v0 .> mx0, v0, mx0)
+            mx1 = select(v1 .> mx1, v1, mx1)
+            i = i + 16
+        }
+        while i + 8 <= n {
+            let v: f32x8 = load(x, i)
+            mx0 = select(v .> mx0, v, mx0)
+            i = i + 8
+        }
+        let merged: f32x8 = select(mx0 .> mx1, mx0, mx1)
+        let simd_mx: f32 = reduce_max(merged)
+        if simd_mx > mx { mx = simd_mx }
+    }
+
+    // Pass 2: exp(x - max) and accumulate sum
+    let vmx: f32x8 = splat(mx)
+    let mut sum0: f32x8 = splat(0.0)
+    let mut sum1: f32x8 = splat(0.0)
+
+    i = 0
+    while i + 16 <= n {
+        let lx0: f32x8 = load(x, i)
+        let lx1: f32x8 = load(x, i + 8)
+        let e0: f32x8 = exp(lx0 .- vmx)
+        let e1: f32x8 = exp(lx1 .- vmx)
+        store(out, i, e0)
+        store(out, i + 8, e1)
+        sum0 = sum0 .+ e0
+        sum1 = sum1 .+ e1
+        i = i + 16
+    }
+    while i + 8 <= n {
+        let lx: f32x8 = load(x, i)
+        let e: f32x8 = exp(lx .- vmx)
+        store(out, i, e)
+        sum0 = sum0 .+ e
+        i = i + 8
+    }
+    let mut sum: f32 = reduce_add(sum0 .+ sum1)
+    while i < n {
+        let e: f32 = exp(x[i] - mx)
+        out[i] = e
+        sum = sum + e
+        i = i + 1
+    }
+
+    // Pass 3: normalize
+    let inv_sum: f32 = 1.0 / sum
+    let vinv: f32x8 = splat(inv_sum)
+    i = 0
+    while i + 8 <= n {
+        let v: f32x8 = load(out, i)
+        store(out, i, v .* vinv)
+        i = i + 8
+    }
+    while i < n {
+        out[i] = out[i] * inv_sum
+        i = i + 1
+    }
+}
