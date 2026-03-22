@@ -15,7 +15,8 @@ pub struct BitNetModel {
     pub rms_eps: f32,
 
     pub layers: Vec<LayerWeights>,
-    pub embed_weight: *const u8,
+    pub embed_weight_f16: *const u8,
+    pub embed_weight_f32: Vec<f32>,
     pub norm_weight: *const f32,
     /// Owned repacked I2_S weight data (keeps pointers valid)
     _weight_data: Vec<Vec<u8>>,
@@ -144,8 +145,36 @@ impl BitNetModel {
         };
 
         // Tied embeddings: token_embd.weight is F16, used for both embed and output
-        let embed_weight: *const u8 = tensor_ptr(gguf, "token_embd.weight")?;
+        let embed_weight_f16: *const u8 = tensor_ptr(gguf, "token_embd.weight")?;
         let norm_weight: *const f32 = tensor_ptr(gguf, "output_norm.weight")?;
+
+        // Pre-convert F16 embedding to F32 for fast output matmul
+        let embed_data = gguf.tensor_data("token_embd.weight")
+            .ok_or("missing tensor: token_embd.weight")?;
+        let n_f16 = vocab_size * hidden_dim;
+        let embed_f16 = unsafe { std::slice::from_raw_parts(embed_data.as_ptr() as *const u16, n_f16) };
+        let mut embed_weight_f32 = Vec::with_capacity(n_f16);
+        for &h in embed_f16 {
+            let sign = ((h >> 15) & 1) as u32;
+            let exp = ((h >> 10) & 0x1f) as u32;
+            let frac = (h & 0x3ff) as u32;
+            let f = if exp == 0 {
+                if frac == 0 { 0.0f32 } else {
+                    // Subnormal
+                    let mut e = 0i32;
+                    let mut fr = frac;
+                    while fr & 0x400 == 0 { fr <<= 1; e -= 1; }
+                    fr &= 0x3ff;
+                    f32::from_bits((sign << 31) | (((127 - 15 + 1 + e) as u32) << 23) | (fr << 13))
+                }
+            } else if exp == 31 {
+                f32::from_bits((sign << 31) | (0xff << 23) | (frac << 13))
+            } else {
+                f32::from_bits((sign << 31) | ((exp + 127 - 15) << 23) | (frac << 13))
+            };
+            embed_weight_f32.push(f);
+        }
+        eprintln!("  F16→F32 embedding: {} floats ({:.1} MB)", n_f16, n_f16 as f64 * 4.0 / 1e6);
 
         let mut layers = Vec::with_capacity(n_layers);
         let mut weight_data: Vec<Vec<u8>> = Vec::new();
@@ -181,7 +210,8 @@ impl BitNetModel {
             rope_theta,
             rms_eps,
             layers,
-            embed_weight,
+            embed_weight_f16,
+            embed_weight_f32,
             norm_weight,
             _weight_data: weight_data,
         })

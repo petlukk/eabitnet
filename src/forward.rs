@@ -61,6 +61,45 @@ fn embed_f16_lookup(embed: *const u8, token: u32, out: &mut [f32], hidden_dim: u
     }
 }
 
+fn f32_matmul_mt(
+    embed: &[f32], x: &[f32], out: &mut [f32], vocab_size: usize, hidden_dim: usize,
+) {
+    use std::thread;
+    let n_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let chunk = (vocab_size + n_threads - 1) / n_threads;
+    let embed_ptr = embed.as_ptr() as usize;
+    let x_ptr = x.as_ptr() as usize;
+    let out_ptr = out.as_mut_ptr() as usize;
+    thread::scope(|s| {
+        for t in 0..n_threads {
+            let start = t * chunk;
+            let end = (start + chunk).min(vocab_size);
+            if start >= end { continue; }
+            s.spawn(move || {
+                let embed = unsafe { std::slice::from_raw_parts((embed_ptr as *const f32).add(start * hidden_dim), (end - start) * hidden_dim) };
+                let x = unsafe { std::slice::from_raw_parts(x_ptr as *const f32, hidden_dim) };
+                let out = unsafe { std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(start), end - start) };
+                for v in 0..(end - start) {
+                    let row = &embed[v * hidden_dim..(v + 1) * hidden_dim];
+                    let mut dot = 0.0f32;
+                    // Unrolled f32 dot product
+                    let mut j = 0;
+                    while j + 4 <= hidden_dim {
+                        dot += row[j] * x[j] + row[j+1] * x[j+1] + row[j+2] * x[j+2] + row[j+3] * x[j+3];
+                        j += 4;
+                    }
+                    while j < hidden_dim {
+                        dot += row[j] * x[j];
+                        j += 1;
+                    }
+                    out[v] = dot;
+                }
+            });
+        }
+    });
+}
+
+#[allow(dead_code)]
 fn f16_matmul_mt(
     embed: *const u8, x: &[f32], out: &mut [f32], vocab_size: usize, hidden_dim: usize,
 ) {
@@ -261,7 +300,20 @@ impl InferenceState {
         let seq_len = pos + 1;
         let gqa_ratio = nh / nkv;
 
-        embed_f16_lookup(model.embed_weight, token, &mut self.x, h);
+        embed_f16_lookup(model.embed_weight_f16, token, &mut self.x, h);
+
+        use std::time::Instant;
+        let profile = pos == 1; // profile second token only
+        let mut t_qkv = 0u128;
+        let mut t_attn = 0u128;
+        let mut t_oproj = 0u128;
+        let mut t_ffn_gu = 0u128;
+        let mut t_ffn_act = 0u128;
+        let mut t_down = 0u128;
+        let mut t_out = 0u128;
+        macro_rules! tick { () => { if profile { Instant::now() } else { Instant::now() } } }
+        macro_rules! tock { ($t:expr, $s:expr) => { if profile { $t += $s.elapsed().as_nanos(); } } }
+
         for layer in 0..model.n_layers {
             let lw = &model.layers[layer];
             unsafe {
@@ -278,6 +330,7 @@ impl InferenceState {
                     &mut act_scale, &mut act_sum, h as i32,
                 );
             }
+            let s = tick!();
             ternary_matmul_mt(
                 lw.wq, self.x_quant.as_ptr(), act_scale, act_sum, lw.wq_scale,
                 &mut self.q, h, h,
@@ -290,6 +343,7 @@ impl InferenceState {
                 lw.wv, self.x_quant.as_ptr(), act_scale, act_sum, lw.wv_scale,
                 &mut self.v, kv, h,
             );
+            tock!(t_qkv, s);
             build_rope_freqs(&mut self.rope_freqs, hd, pos, model.rope_theta);
             apply_rope(&mut self.q, &self.rope_freqs, hd, nh);
             apply_rope(&mut self.k, &self.rope_freqs, hd, nkv);
@@ -300,7 +354,7 @@ impl InferenceState {
                 self.v_cache[off..off + hd]
                     .copy_from_slice(&self.v[head * hd..(head + 1) * hd]);
             }
-            // Fused attention: single-pass score + online softmax + V accumulate
+            let s = tick!();
             let scale = 1.0 / (hd as f32).sqrt();
             for head in 0..nh {
                 let kv_head = head / gqa_ratio;
@@ -316,6 +370,8 @@ impl InferenceState {
                     );
                 }
             }
+            tock!(t_attn, s);
+            let s = tick!();
             unsafe {
                 ffi::rmsnorm_f32(
                     self.attn_out.as_ptr(), lw.attn_sub_norm, self.attn_out.as_mut_ptr(),
@@ -334,6 +390,7 @@ impl InferenceState {
                 lw.wo, self.attn_out_quant.as_ptr(), attn_scale, attn_sum, lw.wo_scale,
                 &mut self.tmp, h, h,
             );
+            tock!(t_oproj, s);
             unsafe {
                 ffi::vecadd_f32(
                     self.x.as_ptr(), self.tmp.as_ptr(),
@@ -357,6 +414,7 @@ impl InferenceState {
                 );
             }
 
+            let s = tick!();
             ternary_matmul_mt(
                 lw.w_gate, self.x_quant.as_ptr(), ffn_scale, ffn_sum, lw.w_gate_scale,
                 &mut self.gate, f, h,
@@ -365,21 +423,24 @@ impl InferenceState {
                 lw.w_up, self.x_quant.as_ptr(), ffn_scale, ffn_sum, lw.w_up_scale,
                 &mut self.up, f, h,
             );
+            tock!(t_ffn_gu, s);
 
+            let s = tick!();
             unsafe {
                 ffi::squared_relu_mul_f32(
                     self.gate.as_ptr(), self.up.as_ptr(),
                     self.hidden.as_mut_ptr(), f as i32,
                 );
             }
-
             unsafe {
                 ffi::rmsnorm_f32(
                     self.hidden.as_ptr(), lw.ffn_sub_norm, self.hidden.as_mut_ptr(),
                     f as i32, model.rms_eps,
                 );
             }
+            tock!(t_ffn_act, s);
 
+            let s = tick!();
             let mut down_scale: f32 = 0.0;
             let mut down_sum: i32 = 0;
             unsafe {
@@ -392,6 +453,7 @@ impl InferenceState {
                 lw.w_down, self.hidden_quant.as_ptr(), down_scale, down_sum, lw.w_down_scale,
                 &mut self.tmp, h, f,
             );
+            tock!(t_down, s);
 
             unsafe {
                 ffi::vecadd_f32(
@@ -409,10 +471,27 @@ impl InferenceState {
             );
         }
 
-        f16_matmul_mt(
-            model.embed_weight, &self.x_norm, &mut self.logits,
+        let s = tick!();
+        f32_matmul_mt(
+            &model.embed_weight_f32, &self.x_norm, &mut self.logits,
             model.vocab_size, h,
         );
+        tock!(t_out, s);
+
+        if profile {
+            let ms = |ns: u128| ns as f64 / 1_000_000.0;
+            let total = t_qkv + t_attn + t_oproj + t_ffn_gu + t_ffn_act + t_down + t_out;
+            let pct = |ns: u128| if total > 0 { ns as f64 / total as f64 * 100.0 } else { 0.0 };
+            eprintln!("\n--- profile (pos=1, 30 layers) ---");
+            eprintln!("  QKV matmul:   {:6.1}ms  ({:.0}%)", ms(t_qkv), pct(t_qkv));
+            eprintln!("  attention:    {:6.1}ms  ({:.0}%)", ms(t_attn), pct(t_attn));
+            eprintln!("  O proj:       {:6.1}ms  ({:.0}%)", ms(t_oproj), pct(t_oproj));
+            eprintln!("  FFN gate+up:  {:6.1}ms  ({:.0}%)", ms(t_ffn_gu), pct(t_ffn_gu));
+            eprintln!("  FFN act+norm: {:6.1}ms  ({:.0}%)", ms(t_ffn_act), pct(t_ffn_act));
+            eprintln!("  FFN down:     {:6.1}ms  ({:.0}%)", ms(t_down), pct(t_down));
+            eprintln!("  output (f16): {:6.1}ms  ({:.0}%)", ms(t_out), pct(t_out));
+            eprintln!("  total:        {:6.1}ms", ms(total));
+        }
     }
 
     pub fn sample_logits(&self, temperature: f32) -> u32 {
