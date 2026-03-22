@@ -220,15 +220,15 @@ impl InferenceState {
 
             // Q, K, V projections (K/V use kv_dim for GQA)
             ternary_matmul(
-                lw.wq, self.x_quant.as_ptr(), act_scale, act_sum, 1.0,
+                lw.wq, self.x_quant.as_ptr(), act_scale, act_sum, lw.wq_scale,
                 &mut self.q, h, h, &mut self.raw_scores,
             );
             ternary_matmul(
-                lw.wk, self.x_quant.as_ptr(), act_scale, act_sum, 1.0,
+                lw.wk, self.x_quant.as_ptr(), act_scale, act_sum, lw.wk_scale,
                 &mut self.k, kv, h, &mut self.raw_scores,
             );
             ternary_matmul(
-                lw.wv, self.x_quant.as_ptr(), act_scale, act_sum, 1.0,
+                lw.wv, self.x_quant.as_ptr(), act_scale, act_sum, lw.wv_scale,
                 &mut self.v, kv, h, &mut self.raw_scores,
             );
 
@@ -281,7 +281,7 @@ impl InferenceState {
                 );
             }
             ternary_matmul(
-                lw.wo, self.attn_out_quant.as_ptr(), attn_scale, attn_sum, 1.0,
+                lw.wo, self.attn_out_quant.as_ptr(), attn_scale, attn_sum, lw.wo_scale,
                 &mut self.tmp, h, h, &mut self.raw_scores,
             );
 
@@ -322,11 +322,11 @@ impl InferenceState {
 
             // Gate and Up projections
             ternary_matmul(
-                lw.w_gate, self.x_quant.as_ptr(), ffn_scale, ffn_sum, 1.0,
+                lw.w_gate, self.x_quant.as_ptr(), ffn_scale, ffn_sum, lw.w_gate_scale,
                 &mut self.gate, f, h, &mut self.raw_scores,
             );
             ternary_matmul(
-                lw.w_up, self.x_quant.as_ptr(), ffn_scale, ffn_sum, 1.0,
+                lw.w_up, self.x_quant.as_ptr(), ffn_scale, ffn_sum, lw.w_up_scale,
                 &mut self.up, f, h, &mut self.raw_scores,
             );
 
@@ -360,7 +360,7 @@ impl InferenceState {
                 );
             }
             ternary_matmul(
-                lw.w_down, self.hidden_quant.as_ptr(), down_scale, down_sum, 1.0,
+                lw.w_down, self.hidden_quant.as_ptr(), down_scale, down_sum, lw.w_down_scale,
                 &mut self.tmp, h, f, &mut self.raw_scores,
             );
 
@@ -372,6 +372,7 @@ impl InferenceState {
                 );
             }
             self.x[..h].copy_from_slice(&self.attn_out[..h]);
+
         }
 
         // Final norm

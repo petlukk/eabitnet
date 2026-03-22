@@ -17,6 +17,8 @@ pub struct BitNetModel {
     pub layers: Vec<LayerWeights>,
     pub embed_weight: *const u8,
     pub norm_weight: *const f32,
+    /// Owned repacked I2_S weight data (keeps pointers valid)
+    _weight_data: Vec<Vec<u8>>,
 }
 
 pub struct LayerWeights {
@@ -31,6 +33,13 @@ pub struct LayerWeights {
     pub w_gate: *const u8,
     pub w_up: *const u8,
     pub w_down: *const u8,
+    pub wq_scale: f32,
+    pub wk_scale: f32,
+    pub wv_scale: f32,
+    pub wo_scale: f32,
+    pub w_gate_scale: f32,
+    pub w_up_scale: f32,
+    pub w_down_scale: f32,
 }
 
 // Safe because GgufFile owns the backing data and must outlive BitNetModel.
@@ -64,6 +73,47 @@ fn get_meta_f32(gguf: &GgufFile, key: &str) -> Option<f32> {
         MetaValue::F64(v) => Some(*v as f32),
         _ => None,
     }
+}
+
+fn load_i2s_tensor(
+    gguf: &GgufFile,
+    name: &str,
+    bufs: &mut Vec<Vec<u8>>,
+) -> Result<(*const u8, f32), String> {
+    static LUT: std::sync::LazyLock<[u8; 256]> = std::sync::LazyLock::new(|| {
+        let mut tbl = [0u8; 256];
+        for b in 0..=255u8 {
+            let g0 = (b >> 6) & 3;
+            let g1 = (b >> 4) & 3;
+            let g2 = (b >> 2) & 3;
+            let g3 = b & 3;
+            tbl[b as usize] = (((g0 + 1) % 3) << 6)
+                | (((g1 + 1) % 3) << 4)
+                | (((g2 + 1) % 3) << 2)
+                | ((g3 + 1) % 3);
+        }
+        tbl
+    });
+
+    let data = gguf
+        .tensor_data(name)
+        .ok_or_else(|| format!("missing tensor: {name}"))?;
+    if data.len() < 32 {
+        return Err(format!("{name}: tensor too small for I2_S scale"));
+    }
+    let scale_off = data.len() - 32;
+    let sb = &data[scale_off..scale_off + 4];
+    let scale = f32::from_le_bytes([sb[0], sb[1], sb[2], sb[3]]);
+
+    let weight_bytes = &data[..scale_off];
+    let mut repacked = Vec::with_capacity(weight_bytes.len());
+    let lut = &*LUT;
+    for &b in weight_bytes {
+        repacked.push(lut[b as usize]);
+    }
+    let ptr = repacked.as_ptr();
+    bufs.push(repacked);
+    Ok((ptr, scale))
 }
 
 impl BitNetModel {
@@ -115,19 +165,24 @@ impl BitNetModel {
         let norm_weight: *const f32 = tensor_ptr(gguf, "output_norm.weight")?;
 
         let mut layers = Vec::with_capacity(n_layers);
+        let mut weight_data: Vec<Vec<u8>> = Vec::new();
         for i in 0..n_layers {
+            let (wq, wq_s) = load_i2s_tensor(gguf, &format!("blk.{i}.attn_q.weight"), &mut weight_data)?;
+            let (wk, wk_s) = load_i2s_tensor(gguf, &format!("blk.{i}.attn_k.weight"), &mut weight_data)?;
+            let (wv, wv_s) = load_i2s_tensor(gguf, &format!("blk.{i}.attn_v.weight"), &mut weight_data)?;
+            let (wo, wo_s) = load_i2s_tensor(gguf, &format!("blk.{i}.attn_output.weight"), &mut weight_data)?;
+            let (wg, wg_s) = load_i2s_tensor(gguf, &format!("blk.{i}.ffn_gate.weight"), &mut weight_data)?;
+            let (wu, wu_s) = load_i2s_tensor(gguf, &format!("blk.{i}.ffn_up.weight"), &mut weight_data)?;
+            let (wd, wd_s) = load_i2s_tensor(gguf, &format!("blk.{i}.ffn_down.weight"), &mut weight_data)?;
             layers.push(LayerWeights {
                 attn_norm: tensor_ptr(gguf, &format!("blk.{i}.attn_norm.weight"))?,
                 attn_sub_norm: tensor_ptr(gguf, &format!("blk.{i}.attn_sub_norm.weight"))?,
-                wq: tensor_ptr(gguf, &format!("blk.{i}.attn_q.weight"))?,
-                wk: tensor_ptr(gguf, &format!("blk.{i}.attn_k.weight"))?,
-                wv: tensor_ptr(gguf, &format!("blk.{i}.attn_v.weight"))?,
-                wo: tensor_ptr(gguf, &format!("blk.{i}.attn_output.weight"))?,
+                wq, wk, wv, wo,
                 ffn_norm: tensor_ptr(gguf, &format!("blk.{i}.ffn_norm.weight"))?,
                 ffn_sub_norm: tensor_ptr(gguf, &format!("blk.{i}.ffn_sub_norm.weight"))?,
-                w_gate: tensor_ptr(gguf, &format!("blk.{i}.ffn_gate.weight"))?,
-                w_up: tensor_ptr(gguf, &format!("blk.{i}.ffn_up.weight"))?,
-                w_down: tensor_ptr(gguf, &format!("blk.{i}.ffn_down.weight"))?,
+                w_gate: wg, w_up: wu, w_down: wd,
+                wq_scale: wq_s, wk_scale: wk_s, wv_scale: wv_s, wo_scale: wo_s,
+                w_gate_scale: wg_s, w_up_scale: wu_s, w_down_scale: wd_s,
             });
         }
 
@@ -145,6 +200,7 @@ impl BitNetModel {
             layers,
             embed_weight,
             norm_weight,
+            _weight_data: weight_data,
         })
     }
 }
