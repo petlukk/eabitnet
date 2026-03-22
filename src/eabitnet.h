@@ -21,6 +21,12 @@ void i2_dot_i8_4row(
     int32_t n
 );
 
+// Per-tensor f32 → int8 activation quantization with sum output
+void quant_f32_i8(const float *src, int8_t *dst, float *out_scale, int32_t *out_sum, int32_t n);
+
+// Pack ternary values {0,1,2} into 2-bit packed bytes
+void pack_ternary_row(const uint8_t *ternary, uint8_t *packed, int32_t n);
+
 #ifdef __cplusplus
 }
 #endif

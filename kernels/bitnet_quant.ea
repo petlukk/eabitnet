@@ -16,6 +16,7 @@ export func quant_f32_i8(
     src: *restrict f32,
     out dst: *mut i8 [cap: n + 12],
     out out_scale: *mut f32 [cap: 1],
+    out out_sum: *mut i32 [cap: 1],
     n: i32
 ) {
     // Pass 1: find absmax using f32x8 SIMD
@@ -56,6 +57,7 @@ export func quant_f32_i8(
             dst[i] = 0
             i = i + 1
         }
+        out_sum[0] = 0
         return
     }
 
@@ -65,6 +67,7 @@ export func quant_f32_i8(
     let v_min: f32x4 = splat(-127.0)
     let v_max: f32x4 = splat(127.0)
 
+    let mut total_sum: i32 = 0
     i = 0
     while i + 4 <= n {
         let v: f32x4 = load(src, i)
@@ -75,8 +78,10 @@ export func quant_f32_i8(
         // Store 4 bytes — store writes 16 but only first 4 matter
         // We step by 4, so next store overwrites the garbage upper bytes
         store(dst, i, narrow)
+        total_sum = total_sum + to_i32(dst[i]) + to_i32(dst[i + 1]) + to_i32(dst[i + 2]) + to_i32(dst[i + 3])
         i = i + 4
     }
+    out_sum[0] = total_sum
 }
 
 // Pack ternary values {0,1,2} into 2-bit packed bytes (BitNet I2_S format)
