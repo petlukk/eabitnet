@@ -1,6 +1,7 @@
 //! Matrix multiplication helpers for BitNet inference.
 
 use crate::ffi;
+use crate::threadpool::ThreadPool;
 
 pub(crate) fn f16_to_f32(h: u16) -> f32 {
     let sign = ((h >> 15) & 1) as u32;
@@ -45,10 +46,8 @@ pub(crate) fn i8_output_matmul_mt(
     embed_i8: &[u8], row_scales: &[f32],
     x: &[f32], out: &mut [f32],
     vocab_size: usize, hidden_dim: usize,
+    pool: &ThreadPool,
 ) {
-    use std::thread;
-    let n_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-
     // Quantize x to i8 (absmax)
     let mut x_amax = 0.0f32;
     for &v in x.iter().take(hidden_dim) {
@@ -64,53 +63,49 @@ pub(crate) fn i8_output_matmul_mt(
         x_sum += q as i32;
     }
 
-    let chunk = ((vocab_size + n_threads - 1) / n_threads + 3) & !3;
     let embed_ptr = embed_i8.as_ptr() as usize;
     let scales_ptr = row_scales.as_ptr() as usize;
     let act_ptr = x_i8.as_ptr() as usize;
     let out_ptr = out.as_mut_ptr() as usize;
     let x_scale = x_amax / 127.0;
 
-    thread::scope(|s| {
-        for t in 0..n_threads {
-            let start = t * chunk;
-            let end = (start + chunk).min(vocab_size);
-            if start >= end { continue; }
-            let count = end - start;
-            s.spawn(move || {
-                let embed = embed_ptr as *const u8;
-                let scales = scales_ptr as *const f32;
-                let act = act_ptr as *const i8;
-                let out = unsafe { std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(start), count) };
-                let h = hidden_dim;
-                let mut raw = vec![0i32; 4];
-                let mut r = 0;
-                while r + 4 <= count {
-                    let row = start + r;
-                    unsafe {
-                        ffi::i8dot_4row(
-                            act,
-                            embed.add(row * h), embed.add((row+1) * h),
-                            embed.add((row+2) * h), embed.add((row+3) * h),
-                            raw.as_mut_ptr(), h as i32,
-                        );
-                    }
-                    for j in 0..4 {
-                        let row_s = unsafe { *scales.add(row + j) };
-                        let corrected = raw[j] - 128 * x_sum;
-                        out[r + j] = corrected as f32 * x_scale * (row_s / 127.0);
-                    }
-                    r += 4;
-                }
-                while r < count {
-                    let row = start + r;
-                    let raw_val = unsafe { ffi::i8dot_1row(act, embed.add(row * h), h as i32) };
-                    let row_s = unsafe { *scales.add(row) };
-                    let corrected = raw_val - 128 * x_sum;
-                    out[r] = corrected as f32 * x_scale * (row_s / 127.0);
-                    r += 1;
-                }
-            });
+    pool.run(pool.thread_count(), |tid, n_threads| {
+        let chunk = ((vocab_size + n_threads - 1) / n_threads + 3) & !3;
+        let start = tid * chunk;
+        let end = (start + chunk).min(vocab_size);
+        if start >= end { return; }
+        let count = end - start;
+        let embed = embed_ptr as *const u8;
+        let scales = scales_ptr as *const f32;
+        let act = act_ptr as *const i8;
+        let out = unsafe { std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(start), count) };
+        let h = hidden_dim;
+        let mut raw = vec![0i32; 4];
+        let mut r = 0;
+        while r + 4 <= count {
+            let row = start + r;
+            unsafe {
+                ffi::i8dot_4row(
+                    act,
+                    embed.add(row * h), embed.add((row+1) * h),
+                    embed.add((row+2) * h), embed.add((row+3) * h),
+                    raw.as_mut_ptr(), h as i32,
+                );
+            }
+            for j in 0..4 {
+                let row_s = unsafe { *scales.add(row + j) };
+                let corrected = raw[j] - 128 * x_sum;
+                out[r + j] = corrected as f32 * x_scale * (row_s / 127.0);
+            }
+            r += 4;
+        }
+        while r < count {
+            let row = start + r;
+            let raw_val = unsafe { ffi::i8dot_1row(act, embed.add(row * h), h as i32) };
+            let row_s = unsafe { *scales.add(row) };
+            let corrected = raw_val - 128 * x_sum;
+            out[r] = corrected as f32 * x_scale * (row_s / 127.0);
+            r += 1;
         }
     });
 }
@@ -118,28 +113,23 @@ pub(crate) fn i8_output_matmul_mt(
 #[allow(dead_code)]
 pub(crate) fn f32_matmul_mt(
     embed: &[f32], x: &[f32], out: &mut [f32], vocab_size: usize, hidden_dim: usize,
+    pool: &ThreadPool,
 ) {
-    use std::thread;
-    let n_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    // Align chunks to 4 for tiled kernel
-    let chunk = ((vocab_size + n_threads - 1) / n_threads + 3) & !3;
     let embed_ptr = embed.as_ptr() as usize;
     let x_ptr = x.as_ptr() as usize;
     let out_ptr = out.as_mut_ptr() as usize;
-    thread::scope(|s| {
-        for t in 0..n_threads {
-            let start = t * chunk;
-            let end = (start + chunk).min(vocab_size);
-            if start >= end { continue; }
-            let count = end - start;
-            s.spawn(move || {
-                let rows = (embed_ptr as *const f32).wrapping_add(start * hidden_dim);
-                let x = x_ptr as *const f32;
-                let out = (out_ptr as *mut f32).wrapping_add(start);
-                unsafe {
-                    ffi::tiled_dot_4row(x, rows, out, hidden_dim as i32, count as i32);
-                }
-            });
+    pool.run(pool.thread_count(), |tid, n_threads| {
+        // Align chunks to 4 for tiled kernel
+        let chunk = ((vocab_size + n_threads - 1) / n_threads + 3) & !3;
+        let start = tid * chunk;
+        let end = (start + chunk).min(vocab_size);
+        if start >= end { return; }
+        let count = end - start;
+        let rows = (embed_ptr as *const f32).wrapping_add(start * hidden_dim);
+        let x = x_ptr as *const f32;
+        let out = (out_ptr as *mut f32).wrapping_add(start);
+        unsafe {
+            ffi::tiled_dot_4row(x, rows, out, hidden_dim as i32, count as i32);
         }
     });
 }
@@ -147,42 +137,34 @@ pub(crate) fn f32_matmul_mt(
 #[allow(dead_code)]
 pub(crate) fn f16_matmul_mt(
     embed: *const u8, x: &[f32], out: &mut [f32], vocab_size: usize, hidden_dim: usize,
+    pool: &ThreadPool,
 ) {
-    use std::thread;
-    let n_threads = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-    let chunk = (vocab_size + n_threads - 1) / n_threads;
-
     let embed_ptr = embed as usize;
     let x_ptr = x.as_ptr() as usize;
     let out_ptr = out.as_mut_ptr() as usize;
 
-    thread::scope(|s| {
-        for t in 0..n_threads {
-            let start = t * chunk;
-            let end = (start + chunk).min(vocab_size);
-            if start >= end {
-                continue;
+    pool.run(pool.thread_count(), |tid, n_threads| {
+        let chunk = (vocab_size + n_threads - 1) / n_threads;
+        let start = tid * chunk;
+        let end = (start + chunk).min(vocab_size);
+        if start >= end { return; }
+        let embed = embed_ptr as *const u8;
+        let x = unsafe { std::slice::from_raw_parts(x_ptr as *const f32, hidden_dim) };
+        let out = unsafe {
+            std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(start), end - start)
+        };
+        for v in 0..(end - start) {
+            let row = unsafe {
+                std::slice::from_raw_parts(
+                    embed.add((start + v) * hidden_dim * 2) as *const u16,
+                    hidden_dim,
+                )
+            };
+            let mut dot = 0.0f32;
+            for d in 0..hidden_dim {
+                dot += f16_to_f32(row[d]) * x[d];
             }
-            s.spawn(move || {
-                let embed = embed_ptr as *const u8;
-                let x = unsafe { std::slice::from_raw_parts(x_ptr as *const f32, hidden_dim) };
-                let out = unsafe {
-                    std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(start), end - start)
-                };
-                for v in 0..(end - start) {
-                    let row = unsafe {
-                        std::slice::from_raw_parts(
-                            embed.add((start + v) * hidden_dim * 2) as *const u16,
-                            hidden_dim,
-                        )
-                    };
-                    let mut dot = 0.0f32;
-                    for d in 0..hidden_dim {
-                        dot += f16_to_f32(row[d]) * x[d];
-                    }
-                    out[v] = dot;
-                }
-            });
+            out[v] = dot;
         }
     });
 }
@@ -192,7 +174,7 @@ pub(crate) fn ternary_matmul_mt_n(
     weight: *const u8, act: *const i8,
     act_scale: f32, act_sum: i32, weight_scale: f32,
     out: &mut [f32], out_dim: usize, in_dim: usize,
-    n_threads: usize,
+    n_threads: usize, pool: &ThreadPool,
 ) {
     let n_threads = n_threads.min(out_dim / 4).max(1);
     if n_threads <= 1 {
@@ -229,45 +211,41 @@ pub(crate) fn ternary_matmul_mt_n(
     let out_ptr = out.as_mut_ptr() as usize;
     let scale = (act_scale / 127.0) * weight_scale;
 
-    std::thread::scope(|s| {
-        for t in 0..n_threads {
-            let start = t * chunk;
-            let end = (start + chunk).min(out_dim);
-            if start >= end {
-                continue;
+    pool.run(n_threads, |tid, _n_threads| {
+        let start = tid * chunk;
+        let end = (start + chunk).min(out_dim);
+        if start >= end {
+            return;
+        }
+        let count = end - start;
+        let weight = weight_ptr as *const u8;
+        let act = act_ptr as *const i8;
+        let out_slice = unsafe {
+            std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(start), count)
+        };
+        let mut raw = vec![0i32; count];
+        let mut r = 0;
+        unsafe {
+            while r + 4 <= count {
+                let row = start + r;
+                ffi::i2_dot_i8_4row(
+                    weight.add(row * row_bytes),
+                    weight.add((row + 1) * row_bytes),
+                    weight.add((row + 2) * row_bytes),
+                    weight.add((row + 3) * row_bytes),
+                    act, raw[r..].as_mut_ptr(), in_dim as i32,
+                );
+                r += 4;
             }
-            let count = end - start;
-            s.spawn(move || {
-                let weight = weight_ptr as *const u8;
-                let act = act_ptr as *const i8;
-                let out_slice = unsafe {
-                    std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(start), count)
-                };
-                let mut raw = vec![0i32; count];
-                let mut r = 0;
-                unsafe {
-                    while r + 4 <= count {
-                        let row = start + r;
-                        ffi::i2_dot_i8_4row(
-                            weight.add(row * row_bytes),
-                            weight.add((row + 1) * row_bytes),
-                            weight.add((row + 2) * row_bytes),
-                            weight.add((row + 3) * row_bytes),
-                            act, raw[r..].as_mut_ptr(), in_dim as i32,
-                        );
-                        r += 4;
-                    }
-                    while r < count {
-                        raw[r] = ffi::i2_dot_i8(
-                            weight.add((start + r) * row_bytes), act, in_dim as i32,
-                        );
-                        r += 1;
-                    }
-                }
-                for i in 0..count {
-                    out_slice[i] = (raw[i] - act_sum) as f32 * scale;
-                }
-            });
+            while r < count {
+                raw[r] = ffi::i2_dot_i8(
+                    weight.add((start + r) * row_bytes), act, in_dim as i32,
+                );
+                r += 1;
+            }
+        }
+        for i in 0..count {
+            out_slice[i] = (raw[i] - act_sum) as f32 * scale;
         }
     });
 }
@@ -277,11 +255,9 @@ pub(crate) fn ternary_matmul_mt(
     weight: *const u8, act: *const i8,
     act_scale: f32, act_sum: i32, weight_scale: f32,
     out: &mut [f32], out_dim: usize, in_dim: usize,
+    pool: &ThreadPool,
 ) {
-    let n_threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    ternary_matmul_mt_n(weight, act, act_scale, act_sum, weight_scale, out, out_dim, in_dim, n_threads);
+    ternary_matmul_mt_n(weight, act, act_scale, act_sum, weight_scale, out, out_dim, in_dim, pool.thread_count(), pool);
 }
 
 /// Run Q + K + V concurrently: Q gets half threads, K and V split the other half.
@@ -290,35 +266,62 @@ pub(crate) fn ternary_matmul_qkv(
     w_k: *const u8, scale_k: f32, out_k: &mut [f32], out_dim_kv: usize,
     w_v: *const u8, scale_v: f32, out_v: &mut [f32],
     act: *const i8, act_scale: f32, act_sum: i32, in_dim: usize,
+    pool: &ThreadPool,
 ) {
-    let total = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let total = pool.thread_count();
     let q_threads = (total / 2).max(1);
-    let kv_threads = (total - q_threads).max(1);
-    let k_threads = (kv_threads / 2).max(1);
-    let v_threads = (kv_threads - k_threads).max(1);
+    let remaining = total - q_threads;
+    let k_threads = remaining / 2;
+    let v_threads = remaining - k_threads;
 
-    let q_ptr = out_q.as_mut_ptr() as usize;
-    let k_ptr = out_k.as_mut_ptr() as usize;
-    let v_ptr = out_v.as_mut_ptr() as usize;
+    let row_bytes = in_dim / 4;
     let act_ptr = act as usize;
-    let wq = w_q as usize;
-    let wk = w_k as usize;
-    let wv = w_v as usize;
 
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            let out = unsafe { std::slice::from_raw_parts_mut(q_ptr as *mut f32, out_dim_q) };
-            ternary_matmul_mt_n(wq as _, act_ptr as _, act_scale, act_sum, scale_q, out, out_dim_q, in_dim, q_threads);
-        });
-        s.spawn(|| {
-            let out = unsafe { std::slice::from_raw_parts_mut(k_ptr as *mut f32, out_dim_kv) };
-            ternary_matmul_mt_n(wk as _, act_ptr as _, act_scale, act_sum, scale_k, out, out_dim_kv, in_dim, k_threads);
-        });
-        s.spawn(|| {
-            let out = unsafe { std::slice::from_raw_parts_mut(v_ptr as *mut f32, out_dim_kv) };
-            ternary_matmul_mt_n(wv as _, act_ptr as _, act_scale, act_sum, scale_v, out, out_dim_kv, in_dim, v_threads);
-        });
-    });
+    let make_work = |w_ptr: usize, out_ptr: usize, out_dim: usize, scale: f32| {
+        move |tid: usize, n_threads: usize| {
+            let chunk = ((out_dim + n_threads - 1) / n_threads + 3) & !3;
+            let start = tid * chunk;
+            let end = (start + chunk).min(out_dim);
+            if start >= end { return; }
+            let count = end - start;
+            let weight = w_ptr as *const u8;
+            let act = act_ptr as *const i8;
+            let out_slice = unsafe {
+                std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(start), count)
+            };
+            let combined_scale = (act_scale / 127.0) * scale;
+            let mut raw = vec![0i32; count];
+            let mut r = 0;
+            unsafe {
+                while r + 4 <= count {
+                    let row = start + r;
+                    ffi::i2_dot_i8_4row(
+                        weight.add(row * row_bytes),
+                        weight.add((row + 1) * row_bytes),
+                        weight.add((row + 2) * row_bytes),
+                        weight.add((row + 3) * row_bytes),
+                        act, raw[r..].as_mut_ptr(), in_dim as i32,
+                    );
+                    r += 4;
+                }
+                while r < count {
+                    raw[r] = ffi::i2_dot_i8(
+                        weight.add((start + r) * row_bytes), act, in_dim as i32,
+                    );
+                    r += 1;
+                }
+            }
+            for i in 0..count {
+                out_slice[i] = (raw[i] - act_sum) as f32 * combined_scale;
+            }
+        }
+    };
+
+    pool.run_split3(
+        q_threads, make_work(w_q as usize, out_q.as_mut_ptr() as usize, out_dim_q, scale_q),
+        k_threads, make_work(w_k as usize, out_k.as_mut_ptr() as usize, out_dim_kv, scale_k),
+        v_threads, make_work(w_v as usize, out_v.as_mut_ptr() as usize, out_dim_kv, scale_v),
+    );
 }
 
 /// Run two ternary matmuls concurrently, splitting threads between them.
@@ -328,32 +331,56 @@ pub(crate) fn ternary_matmul_parallel_pair(
     act: *const i8, act_scale: f32, act_sum: i32,
     out_a: &mut [f32], out_b: &mut [f32],
     out_dim: usize, in_dim: usize,
+    pool: &ThreadPool,
 ) {
-    let total = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let total = pool.thread_count();
     let half = (total / 2).max(1);
 
-    let a_ptr = out_a.as_mut_ptr() as usize;
-    let b_ptr = out_b.as_mut_ptr() as usize;
+    let row_bytes = in_dim / 4;
     let act_ptr = act as usize;
-    let w_a_ptr = w_a as usize;
-    let w_b_ptr = w_b as usize;
 
-    std::thread::scope(|s| {
-        s.spawn(|| {
-            let out = unsafe { std::slice::from_raw_parts_mut(a_ptr as *mut f32, out_dim) };
-            ternary_matmul_mt_n(
-                w_a_ptr as *const u8, act_ptr as *const i8,
-                act_scale, act_sum, scale_a, out, out_dim, in_dim, half,
-            );
-        });
-        s.spawn(|| {
-            let out = unsafe { std::slice::from_raw_parts_mut(b_ptr as *mut f32, out_dim) };
-            ternary_matmul_mt_n(
-                w_b_ptr as *const u8, act_ptr as *const i8,
-                act_scale, act_sum, scale_b, out, out_dim, in_dim, total - half,
-            );
-        });
-    });
+    let make_work = |w_ptr: usize, out_ptr: usize, scale: f32| {
+        move |tid: usize, n_threads: usize| {
+            let chunk = ((out_dim + n_threads - 1) / n_threads + 3) & !3;
+            let start = tid * chunk;
+            let end = (start + chunk).min(out_dim);
+            if start >= end { return; }
+            let count = end - start;
+            let weight = w_ptr as *const u8;
+            let act = act_ptr as *const i8;
+            let out_slice = unsafe {
+                std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(start), count)
+            };
+            let combined_scale = (act_scale / 127.0) * scale;
+            let mut raw = vec![0i32; count];
+            let mut r = 0;
+            unsafe {
+                while r + 4 <= count {
+                    let row = start + r;
+                    ffi::i2_dot_i8_4row(
+                        weight.add(row * row_bytes),
+                        weight.add((row + 1) * row_bytes),
+                        weight.add((row + 2) * row_bytes),
+                        weight.add((row + 3) * row_bytes),
+                        act, raw[r..].as_mut_ptr(), in_dim as i32,
+                    );
+                    r += 4;
+                }
+                while r < count {
+                    raw[r] = ffi::i2_dot_i8(
+                        weight.add((start + r) * row_bytes), act, in_dim as i32,
+                    );
+                    r += 1;
+                }
+            }
+            for i in 0..count {
+                out_slice[i] = (raw[i] - act_sum) as f32 * combined_scale;
+            }
+        }
+    };
+
+    pool.run_split2(
+        half, make_work(w_a as usize, out_a.as_mut_ptr() as usize, scale_a),
+        total - half, make_work(w_b as usize, out_b.as_mut_ptr() as usize, scale_b),
+    );
 }

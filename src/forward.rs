@@ -3,8 +3,10 @@
 use crate::ffi;
 use crate::matmul::{embed_f16_lookup, i8_output_matmul_mt, ternary_matmul_mt, ternary_matmul_parallel_pair, ternary_matmul_qkv};
 use crate::model::BitNetModel;
+use crate::threadpool::ThreadPool;
 
 pub struct InferenceState {
+    pool: ThreadPool,
     x: Vec<f32>,
     x_norm: Vec<f32>,
     x_quant: Vec<i8>,
@@ -65,6 +67,7 @@ impl InferenceState {
         let v = model.vocab_size;
         let kv_cache_size = model.n_layers * model.n_kv_heads * max_seq_len * model.head_dim;
         InferenceState {
+            pool: ThreadPool::new(),
             x: vec![0.0; h],
             x_norm: vec![0.0; h],
             x_quant: vec![0; h + 12],
@@ -132,6 +135,7 @@ impl InferenceState {
                 lw.wk, lw.wk_scale, &mut self.k, kv,
                 lw.wv, lw.wv_scale, &mut self.v,
                 self.x_quant.as_ptr(), act_scale, act_sum, h,
+                &self.pool,
             );
             tock!(t_qkv, s);
             build_rope_freqs(&mut self.rope_freqs, hd, pos, model.rope_theta);
@@ -178,7 +182,7 @@ impl InferenceState {
             }
             ternary_matmul_mt(
                 lw.wo, self.attn_out_quant.as_ptr(), attn_scale, attn_sum, lw.wo_scale,
-                &mut self.tmp, h, h,
+                &mut self.tmp, h, h, &self.pool,
             );
             tock!(t_oproj, s);
             unsafe {
@@ -210,7 +214,7 @@ impl InferenceState {
                 lw.w_up, lw.w_up_scale,
                 self.x_quant.as_ptr(), ffn_scale, ffn_sum,
                 &mut self.gate, &mut self.up,
-                f, h,
+                f, h, &self.pool,
             );
             tock!(t_ffn_gu, s);
 
@@ -240,7 +244,7 @@ impl InferenceState {
             }
             ternary_matmul_mt(
                 lw.w_down, self.hidden_quant.as_ptr(), down_scale, down_sum, lw.w_down_scale,
-                &mut self.tmp, h, f,
+                &mut self.tmp, h, f, &self.pool,
             );
             tock!(t_down, s);
 
@@ -264,7 +268,7 @@ impl InferenceState {
         i8_output_matmul_mt(
             &model.embed_weight_i8, &model.embed_row_scales,
             &self.x_norm, &mut self.logits,
-            model.vocab_size, h,
+            model.vocab_size, h, &self.pool,
         );
         tock!(t_out, s);
 
