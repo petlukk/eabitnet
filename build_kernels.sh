@@ -7,7 +7,7 @@ EA="${EA:-$HOME/projects/eacompute/target/release/ea}"
 
 mkdir -p "$OUT_DIR"
 
-echo "Building eabitnet kernels..."
+echo "Building cougar kernels..."
 
 ARCH=$(uname -m)
 

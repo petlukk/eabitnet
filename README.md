@@ -1,8 +1,20 @@
-# eabitnet
+```
+        /\_/\
+       ( o.o )  ╔═══════════════════════════════════╗
+        > ^ <   ║  C O U G A R                      ║
+       /|   |\  ║  BitNet b1.58 inference engine     ║
+      (_|   |_) ╚═══════════════════════════════════╝
+```
 
-Standalone BitNet b1.58 2B-4T inference via [Ea](https://github.com/petlukk/eacompute) SIMD kernels. No llama.cpp. No dependencies.
+# Cougar
 
-**10 tok/s** on 16 threads. **~3200 lines** total. **118 tests**.
+Llama.cpp is a beast, but even beasts have predators. 🐾
+
+A ~3,000-line BitNet b1.58 engine written in Rust + [Eä](https://github.com/petlukk/eacompute) SIMD kernels. No llama.cpp. No dependencies.
+
+🚀 **10.3 tok/s** (AVX2 / 16 threads) · 📦 **644 KB** binary · 🚫 Zero dependencies
+
+It doesn't just run models. It hunts them.
 
 ## Quick start
 
@@ -14,7 +26,7 @@ make kernels
 RUSTFLAGS="-L build/lib" cargo build --release
 
 # Run
-LD_LIBRARY_PATH=build/lib ./target/release/eabitnet \
+LD_LIBRARY_PATH=build/lib ./target/release/cougar \
   --model path/to/ggml-model-i2_s.gguf \
   --prompt "The capital of France is"
 ```
@@ -87,7 +99,7 @@ attention:      0.2ms        fused online softmax
 ## Architecture
 
 ```
-eabitnet/
+cougar/
   kernels/    13 Ea kernels (.ea -> .so via eacompute)
   src/        7 Rust modules (gguf, tokenizer, model, forward, matmul, ffi, main)
   tests/      13 C test harnesses (118 tests)
@@ -104,9 +116,9 @@ The model runs BitNet b1.58 2B-4T with:
 Download from HuggingFace:
 
 ```bash
-mkdir -p ~/.eabitnet/models
+mkdir -p ~/.cougar/models
 curl -L "https://huggingface.co/microsoft/bitnet-b1.58-2B-4T-gguf/resolve/main/ggml-model-i2_s.gguf" \
-  -o ~/.eabitnet/models/ggml-model-i2_s.gguf
+  -o ~/.cougar/models/ggml-model-i2_s.gguf
 ```
 
 ## Model quality
@@ -122,12 +134,12 @@ BitNet b1.58 2B-4T is a **2 billion parameter** model with **1-bit weights**. It
 
 Greedy decoding (temperature=0) tends to repeat after 20-30 tokens. This is normal for small models without top-p/top-k sampling.
 
-The point of eabitnet is proving the **inference engine**, not the model. If you want better answers, wait for larger BitNet models and drop them in — the runner handles any BitNet GGUF.
+The point of cougar is proving the **inference engine**, not the model. If you want better answers, wait for larger BitNet models and drop them in — the runner handles any BitNet GGUF.
 
 ## CLI
 
 ```
-eabitnet --model <path.gguf> --prompt <text> [options]
+cougar --model <path.gguf> --prompt <text> [options]
 
 Options:
   --max-tokens N      Maximum tokens to generate (default: 128)
@@ -147,8 +159,8 @@ Requires:
 # Build eacompute first
 cd ~/projects/eacompute && cargo build --release --features=llvm
 
-# Build eabitnet
-cd ~/projects/eabitnet
+# Build cougar
+cd ~/projects/cougar
 make kernels                              # compile .ea -> .so
 RUSTFLAGS="-L build/lib" cargo build --release
 make test                                 # 102 kernel tests
@@ -164,14 +176,14 @@ The Ea kernels compile to shared libraries (`.so` files) in `build/lib/`. Both t
 RUSTFLAGS="-L build/lib" cargo build --release
 
 # At runtime — tell the dynamic linker where to find them
-LD_LIBRARY_PATH=build/lib ./target/release/eabitnet --model ...
+LD_LIBRARY_PATH=build/lib ./target/release/cougar --model ...
 ```
 
 To avoid typing `LD_LIBRARY_PATH` every time, add the full path to your shell profile:
 
 ```bash
 # Add to ~/.bashrc or ~/.zshrc
-export LD_LIBRARY_PATH="$HOME/projects/eabitnet/build/lib:$LD_LIBRARY_PATH"
+export LD_LIBRARY_PATH="$HOME/projects/cougar/build/lib:$LD_LIBRARY_PATH"
 ```
 
 Or install the libraries system-wide:

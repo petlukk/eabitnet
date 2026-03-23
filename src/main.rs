@@ -50,11 +50,11 @@ fn main() {
     }
 
     let model_path = model_path.unwrap_or_else(|| {
-        eprintln!("Usage: eabitnet --model <path.gguf> --prompt <text> [--max-tokens N] [--temperature T]");
+        eprintln!("Usage: cougar --model <path.gguf> --prompt <text> [--max-tokens N] [--temperature T]");
         std::process::exit(1);
     });
     let prompt_text = prompt.unwrap_or_else(|| {
-        eprintln!("Usage: eabitnet --model <path.gguf> --prompt <text>");
+        eprintln!("Usage: cougar --model <path.gguf> --prompt <text>");
         std::process::exit(1);
     });
 
@@ -77,13 +77,13 @@ fn main() {
     });
 
     eprintln!(
-        "eabitnet: {} layers, {}d, {} heads, {} vocab",
+        "cougar> {} layers, {}d, {} heads, {} vocab",
         model.n_layers, model.hidden_dim, model.n_heads, model.vocab_size,
     );
 
     let mut tokens = vec![tokenizer.bos_id];
     tokens.extend(tokenizer.encode(prompt_text));
-    eprintln!("Prompt: {} tokens", tokens.len());
+    eprintln!("cougar> prompt: {} tokens", tokens.len());
 
     let (output, _prefill_ms, _decode_ms) = InferenceState::generate(
         &model, &tokens, max_tokens, temperature, tokenizer.eos_id, max_seq_len, true,
