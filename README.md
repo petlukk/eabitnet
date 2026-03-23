@@ -12,7 +12,7 @@ Llama.cpp is a beast, but even beasts have predators. 🐾
 
 A ~3,000-line BitNet b1.58 engine written in Rust + [Eä](https://github.com/petlukk/eacompute) SIMD kernels. No llama.cpp. No dependencies.
 
-🚀 **10.3 tok/s** (AVX2 / 16 threads) · 📦 **644 KB** binary · 🚫 Zero dependencies
+🚀 **17.4 tok/s** (AVX2 / 16 threads) · 📦 **644 KB** binary · 🚫 Zero dependencies
 
 It doesn't just run models. It hunts them.
 
@@ -39,7 +39,7 @@ Loads a BitNet b1.58 2B-4T GGUF file and generates text. The entire inference pi
 - **Fused attention** (`fused_attention_f32`) -- single-pass online softmax, no scores buffer
 - **RMSNorm, softmax, RoPE, squared ReLU** -- all Ea kernels
 - **i8 output projection** (`i8dot_4row`) -- quantized embedding for 4x bandwidth reduction
-- **Multi-threaded** -- `std::thread::scope` partitions work across all cores
+- **Persistent thread pool** -- condvar-based pool, zero per-dispatch overhead
 
 ## Performance
 
@@ -47,9 +47,9 @@ BitNet b1.58 2B-4T (30 layers, 2560 hidden, 20 heads, 128K vocab) on x86-64:
 
 | Metric | Value |
 |--------|-------|
-| Decode throughput | 10.0 tok/s |
-| Decode latency | ~100 ms/tok |
-| Prefill throughput | 10.0 tok/s |
+| Decode throughput | **17.4 tok/s** |
+| Decode latency | **57.6 ms/tok** |
+| Prefill throughput | 17.1 tok/s |
 | Threads | 16 |
 | Binary size | 644 KB |
 | Model RSS | ~2.0 GB |
@@ -63,17 +63,18 @@ BitNet b1.58 2B-4T (30 layers, 2560 hidden, 20 heads, 128K vocab) on x86-64:
  6.5 tok/s  +parallel K/V, gate/up pairs
  7.4 tok/s  +concurrent Q+K+V
 10.0 tok/s  +i8 quantized output projection
+17.4 tok/s  +persistent thread pool (beats bitnet.cpp 15.05)
 ```
 
-### Per-stage profile (100ms/tok)
+### Per-stage profile (57.6ms/tok)
 
 ```
-FFN gate+up:   28ms (27%)   2x ternary matmul, parallel pair
-QKV:           22ms (21%)   concurrent Q+K+V
-FFN down:      21ms (20%)   1x ternary matmul
-O proj:        19ms (18%)   1x ternary matmul
-output (i8):   13ms (13%)   i8 quantized, was 49ms with f32
-attention:      0.2ms        fused online softmax
+FFN gate+up:  19.6ms (37%)   2x ternary matmul, parallel pair
+output (i8):  11.7ms (22%)   i8 quantized embedding projection
+FFN down:      9.7ms (18%)   1x ternary matmul
+QKV:           6.7ms (13%)   concurrent Q+K+V via run_split3
+O proj:        5.2ms (10%)   1x ternary matmul
+attention:     0.2ms          fused online softmax
 ```
 
 ## Kernels
@@ -101,7 +102,7 @@ attention:      0.2ms        fused online softmax
 ```
 cougar/
   kernels/    13 Ea kernels (.ea -> .so via eacompute)
-  src/        7 Rust modules (gguf, tokenizer, model, forward, matmul, ffi, main)
+  src/        8 Rust modules (gguf, tokenizer, model, forward, matmul, threadpool, ffi, main)
   tests/      13 C test harnesses (118 tests)
 ```
 
@@ -151,7 +152,7 @@ Options:
 
 Requires:
 - [eacompute](https://github.com/petlukk/eacompute) compiler (`ea` binary)
-- Rust 1.63+ (for `std::thread::scope`)
+- Rust 1.63+
 - GCC (for kernel test harnesses)
 - x86-64 with AVX2 + FMA
 

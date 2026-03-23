@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "eabitnet"
+name = "cougar"
 version = "0.1.0"
