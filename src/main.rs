@@ -5,6 +5,7 @@ mod forward_llama;
 mod gguf;
 mod matmul;
 mod matmul_q4k;
+mod matmul_q6k;
 mod model;
 mod repl;
 mod server;

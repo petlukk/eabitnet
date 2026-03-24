@@ -216,6 +216,11 @@ fn tensor_byte_size(dims: &[u64], dtype: u32) -> Result<usize, String> {
         let n_blocks = (n_elements as usize + 255) / 256;
         return Ok(n_blocks * 144);
     }
+    if dtype == 14 {
+        // Q6_K: block_q6_K = 128(ql) + 64(qh) + 16(scales) + 2(d) = 210 bytes per 256 elements
+        let n_blocks = (n_elements as usize + 255) / 256;
+        return Ok(n_blocks * 210);
+    }
     let (bits, block) = gguf_type_size(dtype)?;
     let n_blocks = (n_elements as usize + block - 1) / block;
     Ok(n_blocks * bits * block / 8)

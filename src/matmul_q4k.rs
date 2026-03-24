@@ -291,6 +291,156 @@ pub(crate) fn q4k_embed_lookup(
     }
 }
 
+/// Per-thread work function for Q4_K matmul. Callable from run_split3.
+pub(crate) unsafe fn q4k_matmul_work(
+    weight: *const u8,
+    row_stride: usize,
+    n_blocks: usize,
+    q8_qs: *const i8,
+    q8_d: *const f32,
+    q8_bsums: *const i32,
+    out: *mut f32,
+    out_dim: usize,
+    tid: usize,
+    n_threads: usize,
+) {
+    let chunk = ((out_dim + n_threads - 1) / n_threads + 3) & !3;
+    let start = tid * chunk;
+    let end = (start + chunk).min(out_dim);
+    if start >= end { return; }
+    let count = end - start;
+    let out_slice = std::slice::from_raw_parts_mut(out.add(start), count);
+
+    let mut scores4 = [0.0f32; 4];
+    let mut r = 0;
+    while r + 4 <= count {
+        let row = start + r;
+        q4k_4row_dot(
+            weight.add(row * row_stride),
+            weight.add((row + 1) * row_stride),
+            weight.add((row + 2) * row_stride),
+            weight.add((row + 3) * row_stride),
+            n_blocks, q8_qs, q8_d, q8_bsums,
+            &mut scores4,
+        );
+        out_slice[r] = scores4[0];
+        out_slice[r + 1] = scores4[1];
+        out_slice[r + 2] = scores4[2];
+        out_slice[r + 3] = scores4[3];
+        r += 4;
+    }
+    while r < count {
+        let row = start + r;
+        out_slice[r] = q4k_row_dot(
+            weight.add(row * row_stride),
+            n_blocks, q8_qs, q8_d, q8_bsums,
+        );
+        r += 1;
+    }
+}
+
+/// Fused 4-row gate+up dot product using dual kernel.
+/// Computes both projections per block — Q8K stays in SIMD registers.
+unsafe fn q4k_dual_4row_dot(
+    gw0: *const u8, gw1: *const u8, gw2: *const u8, gw3: *const u8,
+    uw0: *const u8, uw1: *const u8, uw2: *const u8, uw3: *const u8,
+    n_blocks: usize,
+    q8_qs: *const i8, q8_d: *const f32, q8_bsums: *const i32,
+    g_scores: &mut [f32; 4], u_scores: &mut [f32; 4],
+) {
+    *g_scores = [0.0; 4]; *u_scores = [0.0; 4];
+    let mut g_blk = [0.0f32; 4]; let mut u_blk = [0.0f32; 4];
+    let mut gsc = [[0u8; 8]; 4]; let mut gmn = [[0u8; 8]; 4];
+    let mut usc = [[0u8; 8]; 4]; let mut umn = [[0u8; 8]; 4];
+
+    for blk in 0..n_blocks {
+        let blk_q8_d = *q8_d.add(blk);
+        let q8_ptr = q8_qs.add(blk * 256);
+        let bsums_ptr = q8_bsums.add(blk * 16);
+        let gbs = [gw0.add(blk * Q4K_BLOCK_BYTES), gw1.add(blk * Q4K_BLOCK_BYTES),
+                   gw2.add(blk * Q4K_BLOCK_BYTES), gw3.add(blk * Q4K_BLOCK_BYTES)];
+        let ubs = [uw0.add(blk * Q4K_BLOCK_BYTES), uw1.add(blk * Q4K_BLOCK_BYTES),
+                   uw2.add(blk * Q4K_BLOCK_BYTES), uw3.add(blk * Q4K_BLOCK_BYTES)];
+
+        let mut gd = [0f32; 4]; let mut gdm = [0f32; 4];
+        let mut ud = [0f32; 4]; let mut udm = [0f32; 4];
+        for i in 0..4 {
+            gd[i] = f16_to_f32(*(gbs[i] as *const u16)) * blk_q8_d;
+            gdm[i] = f16_to_f32(*(gbs[i].add(2) as *const u16)) * blk_q8_d;
+            unpack_q4k_scales(std::slice::from_raw_parts(gbs[i].add(4), 12), &mut gsc[i], &mut gmn[i]);
+            ud[i] = f16_to_f32(*(ubs[i] as *const u16)) * blk_q8_d;
+            udm[i] = f16_to_f32(*(ubs[i].add(2) as *const u16)) * blk_q8_d;
+            unpack_q4k_scales(std::slice::from_raw_parts(ubs[i].add(4), 12), &mut usc[i], &mut umn[i]);
+        }
+
+        ffi::q4k_dot_q8k_4row_dual(
+            gbs[0].add(16), gbs[1].add(16), gbs[2].add(16), gbs[3].add(16),
+            ubs[0].add(16), ubs[1].add(16), ubs[2].add(16), ubs[3].add(16),
+            q8_ptr, bsums_ptr,
+            gsc[0].as_ptr(), gsc[1].as_ptr(), gsc[2].as_ptr(), gsc[3].as_ptr(),
+            gmn[0].as_ptr(), gmn[1].as_ptr(), gmn[2].as_ptr(), gmn[3].as_ptr(),
+            usc[0].as_ptr(), usc[1].as_ptr(), usc[2].as_ptr(), usc[3].as_ptr(),
+            umn[0].as_ptr(), umn[1].as_ptr(), umn[2].as_ptr(), umn[3].as_ptr(),
+            g_blk.as_mut_ptr(), u_blk.as_mut_ptr(), 1,
+            gd[0], gd[1], gd[2], gd[3], gdm[0], gdm[1], gdm[2], gdm[3],
+            ud[0], ud[1], ud[2], ud[3], udm[0], udm[1], udm[2], udm[3],
+        );
+
+        for i in 0..4 { g_scores[i] += g_blk[i]; u_scores[i] += u_blk[i]; }
+    }
+}
+
+/// Vertically fused gate+up+SiLU: dual kernel → SiLU inline → write hidden directly.
+/// Eliminates gate[] and up[] memory round-trip (160KB/layer saved).
+pub(crate) unsafe fn q4k_fused_gate_up_silu_work(
+    w_gate: *const u8,
+    w_up: *const u8,
+    row_stride: usize,
+    n_blocks: usize,
+    q8_qs: *const i8,
+    q8_d: *const f32,
+    q8_bsums: *const i32,
+    hidden_out: *mut f32,
+    out_dim: usize,
+    tid: usize,
+    n_threads: usize,
+) {
+    let chunk = ((out_dim + n_threads - 1) / n_threads + 3) & !3;
+    let start = tid * chunk;
+    let end = (start + chunk).min(out_dim);
+    if start >= end { return; }
+    let count = end - start;
+    let out = std::slice::from_raw_parts_mut(hidden_out.add(start), count);
+
+    let mut g_scores = [0.0f32; 4];
+    let mut u_scores = [0.0f32; 4];
+    let mut r = 0;
+    while r + 4 <= count {
+        let row = start + r;
+        q4k_dual_4row_dot(
+            w_gate.add(row * row_stride), w_gate.add((row+1) * row_stride),
+            w_gate.add((row+2) * row_stride), w_gate.add((row+3) * row_stride),
+            w_up.add(row * row_stride), w_up.add((row+1) * row_stride),
+            w_up.add((row+2) * row_stride), w_up.add((row+3) * row_stride),
+            n_blocks, q8_qs, q8_d, q8_bsums,
+            &mut g_scores, &mut u_scores,
+        );
+        // SiLU inline: hidden[i] = silu(gate[i]) * up[i]
+        for i in 0..4 {
+            let g = g_scores[i];
+            out[r + i] = (g / (1.0 + (-g).exp())) * u_scores[i];
+        }
+        r += 4;
+    }
+    while r < count {
+        let row = start + r;
+        let g = q4k_row_dot(w_gate.add(row * row_stride), n_blocks, q8_qs, q8_d, q8_bsums);
+        let u = q4k_row_dot(w_up.add(row * row_stride), n_blocks, q8_qs, q8_d, q8_bsums);
+        out[r] = (g / (1.0 + (-g).exp())) * u;
+        r += 1;
+    }
+}
+
 #[cfg(test)]
 #[path = "matmul_q4k_tests.rs"]
 mod tests;

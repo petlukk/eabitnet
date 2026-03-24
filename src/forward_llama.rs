@@ -3,12 +3,13 @@
 use crate::ffi;
 use crate::forward::{apply_rope, build_rope_freqs, sample};
 use crate::matmul::embed_f16_lookup;
-use crate::matmul_q4k::{q4k_embed_lookup, q4k_matmul_mt};
+use crate::matmul_q4k::{q4k_embed_lookup, q4k_matmul_mt, q4k_matmul_work, q4k_fused_gate_up_silu_work};
+use crate::matmul_q6k::{q6k_embed_lookup, q6k_matmul_mt, q6k_matmul_work};
 use crate::model::BitNetModel;
 use crate::threadpool::ThreadPool;
 
-/// Q4_K block size: 256 elements per super-block.
 const Q4K_BLOCK_BYTES: usize = 144;
+const Q6K_BLOCK_BYTES: usize = 210;
 
 pub struct LlamaState {
     pool: ThreadPool,
@@ -55,20 +56,20 @@ impl LlamaState {
             pool: ThreadPool::new(),
             x: vec![0.0; h],
             x_norm: vec![0.0; h],
-            x_q8_qs: vec![0; h],
+            x_q8_qs: vec![0; h + 16],
             x_q8_d: vec![0.0; hb],
             x_q8_bsums: vec![0; hb * 16],
             q: vec![0.0; h],
             k: vec![0.0; model.kv_dim],
             v: vec![0.0; model.kv_dim],
             attn_out: vec![0.0; h],
-            attn_q8_qs: vec![0; h],
+            attn_q8_qs: vec![0; h + 16],
             attn_q8_d: vec![0.0; hb],
             attn_q8_bsums: vec![0; hb * 16],
             gate: vec![0.0; f],
             up: vec![0.0; f],
             hidden: vec![0.0; f],
-            hidden_q8_qs: vec![0; f],
+            hidden_q8_qs: vec![0; f + 16],
             hidden_q8_d: vec![0.0; fb],
             hidden_q8_bsums: vec![0; fb * 16],
             logits: vec![0.0; v],
@@ -95,10 +96,10 @@ impl LlamaState {
         let f_row_stride = f_nb * Q4K_BLOCK_BYTES;
 
         // Embedding lookup
-        if model.embed_dtype == 12 {
-            q4k_embed_lookup(model.embed_weight_f16, token, &mut self.x, h);
-        } else {
-            embed_f16_lookup(model.embed_weight_f16, token, &mut self.x, h);
+        match model.embed_dtype {
+            12 => q4k_embed_lookup(model.embed_weight_f16, token, &mut self.x, h),
+            14 => q6k_embed_lookup(model.embed_weight_f16, token, &mut self.x, h),
+            _ => embed_f16_lookup(model.embed_weight_f16, token, &mut self.x, h),
         }
 
         use std::time::Instant;
@@ -142,27 +143,47 @@ impl LlamaState {
                 );
             }
 
-            // 3-5. Q4K matmul: Q, K, V
-            // Row stride = input_dim / 256 * 144 (each row has hidden_dim elements)
+            // 3-5. QKV concurrent dispatch (Q gets half threads, K+V split rest)
+            let total = self.pool.thread_count();
+            let wv_bb = lw.wv_block_bytes;
             prof!(t_qkv, {
-                q4k_matmul_mt(
-                    lw.wq, h_row_stride, h_nb,
-                    self.x_q8_qs.as_ptr(), self.x_q8_d.as_ptr(),
-                    self.x_q8_bsums.as_ptr(),
-                    &mut self.q, h, &self.pool,
-                );
-                q4k_matmul_mt(
-                    lw.wk, h_row_stride, h_nb,
-                    self.x_q8_qs.as_ptr(), self.x_q8_d.as_ptr(),
-                    self.x_q8_bsums.as_ptr(),
-                    &mut self.k, kv, &self.pool,
-                );
-                q4k_matmul_mt(
-                    lw.wv, h_row_stride, h_nb,
-                    self.x_q8_qs.as_ptr(), self.x_q8_d.as_ptr(),
-                    self.x_q8_bsums.as_ptr(),
-                    &mut self.v, kv, &self.pool,
-                );
+                if total >= 3 {
+                    let q_t = (total / 2).max(1);
+                    let rem = total - q_t;
+                    let k_t = rem / 2;
+                    let v_t = rem - k_t;
+                    let q8p = self.x_q8_qs.as_ptr() as usize;
+                    let q8d = self.x_q8_d.as_ptr() as usize;
+                    let q8b = self.x_q8_bsums.as_ptr() as usize;
+                    let q_out = self.q.as_mut_ptr() as usize;
+                    let k_out = self.k.as_mut_ptr() as usize;
+                    let v_out = self.v.as_mut_ptr() as usize;
+                    let wq = lw.wq as usize; let wk = lw.wk as usize; let wv = lw.wv as usize;
+                    let h_q6k_stride = h_nb * Q6K_BLOCK_BYTES;
+                    self.pool.run_split3(
+                        q_t, |tid, nt| unsafe {
+                            q4k_matmul_work(wq as _, h_row_stride, h_nb, q8p as _, q8d as _, q8b as _, q_out as _, h, tid, nt);
+                        },
+                        k_t, |tid, nt| unsafe {
+                            q4k_matmul_work(wk as _, h_row_stride, h_nb, q8p as _, q8d as _, q8b as _, k_out as _, kv, tid, nt);
+                        },
+                        v_t, |tid, nt| unsafe {
+                            if wv_bb == Q6K_BLOCK_BYTES {
+                                q6k_matmul_work(wv as _, h_q6k_stride, h_nb, q8p as _, q8d as _, q8b as _, v_out as _, kv, tid, nt);
+                            } else {
+                                q4k_matmul_work(wv as _, h_row_stride, h_nb, q8p as _, q8d as _, q8b as _, v_out as _, kv, tid, nt);
+                            }
+                        },
+                    );
+                } else {
+                    q4k_matmul_mt(lw.wq, h_row_stride, h_nb, self.x_q8_qs.as_ptr(), self.x_q8_d.as_ptr(), self.x_q8_bsums.as_ptr(), &mut self.q, h, &self.pool);
+                    q4k_matmul_mt(lw.wk, h_row_stride, h_nb, self.x_q8_qs.as_ptr(), self.x_q8_d.as_ptr(), self.x_q8_bsums.as_ptr(), &mut self.k, kv, &self.pool);
+                    if wv_bb == Q6K_BLOCK_BYTES {
+                        q6k_matmul_mt(lw.wv, h_nb * Q6K_BLOCK_BYTES, h_nb, self.x_q8_qs.as_ptr(), self.x_q8_d.as_ptr(), self.x_q8_bsums.as_ptr(), &mut self.v, kv, &self.pool);
+                    } else {
+                        q4k_matmul_mt(lw.wv, h_row_stride, h_nb, self.x_q8_qs.as_ptr(), self.x_q8_d.as_ptr(), self.x_q8_bsums.as_ptr(), &mut self.v, kv, &self.pool);
+                    }
+                }
             });
 
             // 6. RoPE
@@ -242,31 +263,23 @@ impl LlamaState {
                 );
             }
 
-            // 14-15. Q4K matmul: gate, up  (shape [ffn_dim, hidden_dim])
+            // 14-16. Fused gate+up+SiLU: dual kernel → SiLU inline → hidden directly
             prof!(t_ffn_gu, {
-                q4k_matmul_mt(
-                    lw.w_gate, h_row_stride, h_nb,
-                    self.x_q8_qs.as_ptr(), self.x_q8_d.as_ptr(),
-                    self.x_q8_bsums.as_ptr(),
-                    &mut self.gate, f, &self.pool,
-                );
-                q4k_matmul_mt(
-                    lw.w_up, h_row_stride, h_nb,
-                    self.x_q8_qs.as_ptr(), self.x_q8_d.as_ptr(),
-                    self.x_q8_bsums.as_ptr(),
-                    &mut self.up, f, &self.pool,
-                );
-            });
-
-            // 16. SiLU: hidden = silu(gate) * up
-            prof!(t_ffn_act, {
-                unsafe {
-                    ffi::silu_mul_f32(
-                        self.gate.as_ptr(), self.up.as_ptr(),
-                        self.hidden.as_mut_ptr(), f as i32,
+                let q8p = self.x_q8_qs.as_ptr() as usize;
+                let q8d = self.x_q8_d.as_ptr() as usize;
+                let q8b = self.x_q8_bsums.as_ptr() as usize;
+                let h_out = self.hidden.as_mut_ptr() as usize;
+                let wg = lw.w_gate as usize;
+                let wu = lw.w_up as usize;
+                self.pool.run(total, |tid, nt| unsafe {
+                    q4k_fused_gate_up_silu_work(
+                        wg as _, wu as _, h_row_stride, h_nb,
+                        q8p as _, q8d as _, q8b as _,
+                        h_out as _, f, tid, nt,
                     );
-                }
+                });
             });
+            let t_ffn_act = 0u128; // fused into gate+up
 
             // 17. Quantize hidden -> Q8K
             prof!(t_down, {
@@ -277,13 +290,22 @@ impl LlamaState {
                         f as i32,
                     );
                 }
-                // 18. Q4K matmul: down = w_down x hidden_q8k (shape [hidden_dim, ffn_dim])
-                q4k_matmul_mt(
-                    lw.w_down, f_row_stride, f_nb,
-                    self.hidden_q8_qs.as_ptr(), self.hidden_q8_d.as_ptr(),
-                    self.hidden_q8_bsums.as_ptr(),
-                    &mut self.tmp, h, &self.pool,
-                );
+                // 18. Matmul: down = w_down x hidden_q8k (may be Q6_K)
+                if lw.w_down_block_bytes == Q6K_BLOCK_BYTES {
+                    q6k_matmul_mt(
+                        lw.w_down, f_nb * Q6K_BLOCK_BYTES, f_nb,
+                        self.hidden_q8_qs.as_ptr(), self.hidden_q8_d.as_ptr(),
+                        self.hidden_q8_bsums.as_ptr(),
+                        &mut self.tmp, h, &self.pool,
+                    );
+                } else {
+                    q4k_matmul_mt(
+                        lw.w_down, f_row_stride, f_nb,
+                        self.hidden_q8_qs.as_ptr(), self.hidden_q8_d.as_ptr(),
+                        self.hidden_q8_bsums.as_ptr(),
+                        &mut self.tmp, h, &self.pool,
+                    );
+                }
             });
 
             // 19. Residual: x = x + down
@@ -313,12 +335,21 @@ impl LlamaState {
                     h as i32,
                 );
             }
-            q4k_matmul_mt(
-                model.output_weight, h_row_stride, h_nb,
-                self.x_q8_qs.as_ptr(), self.x_q8_d.as_ptr(),
-                self.x_q8_bsums.as_ptr(),
-                &mut self.logits, model.vocab_size, &self.pool,
-            );
+            if model.output_block_bytes == Q6K_BLOCK_BYTES {
+                q6k_matmul_mt(
+                    model.output_weight, h_nb * Q6K_BLOCK_BYTES, h_nb,
+                    self.x_q8_qs.as_ptr(), self.x_q8_d.as_ptr(),
+                    self.x_q8_bsums.as_ptr(),
+                    &mut self.logits, model.vocab_size, &self.pool,
+                );
+            } else {
+                q4k_matmul_mt(
+                    model.output_weight, h_row_stride, h_nb,
+                    self.x_q8_qs.as_ptr(), self.x_q8_d.as_ptr(),
+                    self.x_q8_bsums.as_ptr(),
+                    &mut self.logits, model.vocab_size, &self.pool,
+                );
+            }
         });
 
         if profile {

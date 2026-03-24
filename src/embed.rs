@@ -51,6 +51,30 @@ pub struct KernelTable {
         f32, f32, f32, f32,
     ),
     pub silu_mul_f32: unsafe extern "C" fn(*const f32, *const f32, *mut f32, i32),
+    pub q4k_dot_q8k_4row_dual: unsafe extern "C" fn(
+        *const u8, *const u8, *const u8, *const u8,
+        *const u8, *const u8, *const u8, *const u8,
+        *const i8, *const i32,
+        *const u8, *const u8, *const u8, *const u8,
+        *const u8, *const u8, *const u8, *const u8,
+        *const u8, *const u8, *const u8, *const u8,
+        *const u8, *const u8, *const u8, *const u8,
+        *mut f32, *mut f32, i32,
+        f32, f32, f32, f32, f32, f32, f32, f32,
+        f32, f32, f32, f32, f32, f32, f32, f32,
+    ),
+    pub q6k_dot_q8k: unsafe extern "C" fn(
+        *const u8, *const u8, *const i8, *const i8, *const i32,
+        i32, f32,
+    ) -> f32,
+    pub q6k_dot_q8k_4row: unsafe extern "C" fn(
+        *const u8, *const u8, *const u8, *const u8,
+        *const u8, *const u8, *const u8, *const u8,
+        *const i8, *const i8, *const i8, *const i8,
+        *const i8, *const i32,
+        *mut f32, i32,
+        f32, f32, f32, f32,
+    ),
 }
 
 // Safety: function pointers are Send+Sync (they point to loaded .so code).
@@ -109,6 +133,7 @@ fn load(dir: &PathBuf) -> Result<KernelTable, String> {
         let q4kq = open_lib(dir, "libq4k_quant.so")?;
         let q4kd = open_lib(dir, "libq4k_dot.so")?;
         let silu = open_lib(dir, "libbitnet_silu.so")?;
+        let q6kd = open_lib(dir, "libq6k_dot.so")?;
 
         Ok(KernelTable {
             i2_dot_i8: sym(i2s, "i2_dot_i8\0")?,
@@ -125,6 +150,9 @@ fn load(dir: &PathBuf) -> Result<KernelTable, String> {
             q4k_dot_q8k: sym(q4kd, "q4k_dot_q8k\0")?,
             q4k_dot_q8k_4row: sym(q4kd, "q4k_dot_q8k_4row\0")?,
             silu_mul_f32: sym(silu, "silu_mul_f32\0")?,
+            q4k_dot_q8k_4row_dual: sym(q4kd, "q4k_dot_q8k_4row_dual\0")?,
+            q6k_dot_q8k: sym(q6kd, "q6k_dot_q8k\0")?,
+            q6k_dot_q8k_4row: sym(q6kd, "q6k_dot_q8k_4row\0")?,
         })
     }
 }
