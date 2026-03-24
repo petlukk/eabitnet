@@ -88,19 +88,21 @@ fn main() {
         i += 1;
     }
 
-    // Default model path: ~/.cougar/models/ggml-model-i2_s.gguf
+    // Auto-detect model: try known default paths
     let model_path = model_path.unwrap_or_else(|| {
-        let default = format!(
-            "{}/.cougar/models/ggml-model-i2_s.gguf",
-            std::env::var("HOME").unwrap_or_default()
-        );
-        if std::path::Path::new(&default).exists() {
-            eprintln!("cougar> using default model: {default}");
-            default
-        } else {
-            eprintln!("{USAGE}");
-            die("--model is required (no default model found at ~/.cougar/models/ggml-model-i2_s.gguf)");
+        let home = std::env::var("HOME").unwrap_or_default();
+        let defaults = [
+            format!("{home}/.cougar/models/ggml-model-i2_s.gguf"),
+            format!("{home}/.cougar/models/Llama-3.2-3B-Instruct-Q4_K_M.gguf"),
+        ];
+        for path in &defaults {
+            if std::path::Path::new(path).exists() {
+                eprintln!("cougar> using default model: {path}");
+                return path.clone();
+            }
         }
+        eprintln!("{USAGE}");
+        die("--model is required (no default model found in ~/.cougar/models/)");
     });
 
     if !interactive && !serve && prompt.is_none() {
