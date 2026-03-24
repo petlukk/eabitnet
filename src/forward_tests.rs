@@ -6,6 +6,9 @@ fn mock_model(hidden_dim: usize, n_layers: usize, n_heads: usize, vocab_size: us
     let head_dim = if n_heads > 0 { hidden_dim / n_heads } else { hidden_dim };
     let n_kv_heads = n_heads.max(1);
     BitNetModel {
+        quant_type: crate::model::QuantType::I2S,
+        activation: crate::model::Activation::SquaredReLU,
+        has_sub_norms: true,
         n_layers,
         hidden_dim,
         n_heads,

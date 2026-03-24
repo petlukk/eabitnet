@@ -2,7 +2,16 @@
 
 use crate::gguf::GgufFile;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum QuantType { I2S, Q4K }
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Activation { SquaredReLU, SiLU }
+
 pub struct BitNetModel {
+    pub quant_type: QuantType,
+    pub activation: Activation,
+    pub has_sub_norms: bool,
     pub n_layers: usize,
     pub hidden_dim: usize,
     pub n_heads: usize,
@@ -130,6 +139,29 @@ impl BitNetModel {
         let rms_eps = get_meta_f32(gguf, &key("attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-5);
 
+        // Detect quant type from first weight tensor
+        let quant_type = {
+            let first_weight = gguf.tensor_map.get("blk.0.attn_q.weight")
+                .or_else(|| gguf.tensor_map.get("blk.0.attn_qkv.weight"));
+            match first_weight {
+                Some(&idx) => match gguf.tensors[idx].dtype {
+                    36 => QuantType::I2S,
+                    12 => QuantType::Q4K,
+                    dt => return Err(format!("unsupported weight quant type: {dt}")),
+                },
+                None => return Err("cannot find weight tensor to detect quant type".into()),
+            }
+        };
+
+        // Detect activation type
+        let activation = match gguf.get_str(&key("activation_function")) {
+            Some("squared_relu") => Activation::SquaredReLU,
+            _ => if quant_type == QuantType::I2S { Activation::SquaredReLU } else { Activation::SiLU },
+        };
+
+        // Detect sub-norms
+        let has_sub_norms = gguf.tensor_map.contains_key("blk.0.attn_sub_norm.weight");
+
         // Get vocab_size from embedding tensor dimensions
         let embed_idx = *gguf
             .tensor_map
@@ -144,6 +176,34 @@ impl BitNetModel {
                 embed_dims.len()
             ));
         };
+
+        if quant_type == QuantType::Q4K {
+            // Q4_K weight loading will be added in a later task (T8).
+            // For now, return model with empty layers and null embed pointers.
+            return Ok(BitNetModel {
+                quant_type,
+                activation,
+                has_sub_norms,
+                n_layers,
+                hidden_dim,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_dim,
+                ffn_dim,
+                vocab_size,
+                rope_theta,
+                rms_eps,
+                layers: Vec::new(),
+                embed_weight_f16: std::ptr::null(),
+                embed_weight_i8: Vec::new(),
+                embed_row_scales: Vec::new(),
+                norm_weight: std::ptr::null(),
+                _weight_data: Vec::new(),
+            });
+        }
+
+        // --- I2_S weight loading path ---
 
         // Tied embeddings: token_embd.weight is F16, used for both embed and output
         let embed_weight_f16: *const u8 = tensor_ptr(gguf, "token_embd.weight")?;
@@ -218,6 +278,9 @@ impl BitNetModel {
         }
 
         Ok(BitNetModel {
+            quant_type,
+            activation,
+            has_sub_norms,
             n_layers,
             hidden_dim,
             n_heads,

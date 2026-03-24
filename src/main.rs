@@ -117,6 +117,11 @@ fn main() {
         "cougar> {} layers, {}d, {} heads, {} vocab",
         model.n_layers, model.hidden_dim, model.n_heads, model.vocab_size,
     );
+    eprintln!("cougar> quant: {:?}, activation: {:?}", model.quant_type, model.activation);
+
+    if model.quant_type == model::QuantType::Q4K {
+        die("Q4_K_M inference not yet implemented — coming in v0.3.0");
+    }
 
     if serve {
         server::run(&model, &tokenizer, max_tokens, temperature, repetition_penalty, max_seq_len, port);
