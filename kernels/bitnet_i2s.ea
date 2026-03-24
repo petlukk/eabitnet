@@ -13,8 +13,8 @@
 
 #[cfg(x86_64)]
 
-// Single-row dot product: one weight row × one activation vector
-// Replaces ggml_vec_dot_i2_i8_s_1x1 (~100 lines of C intrinsics)
+// Single-row dot product with dual accumulators.
+// Two independent accumulator chains hide maddubs latency.
 export func i2_dot_i8(
     weights: *restrict u8,
     activations: *restrict i8,
@@ -24,7 +24,8 @@ export func i2_dot_i8(
     let s6: u8x16 = splat(6)
     let s4: u8x16 = splat(4)
     let s2: u8x16 = splat(2)
-    let mut acc: i32x4 = splat(0)
+    let mut acc_a: i32x4 = splat(0)
+    let mut acc_b: i32x4 = splat(0)
     let n_blocks: i32 = n / 128
 
     let mut blk: i32 = 0
@@ -32,8 +33,6 @@ export func i2_dot_i8(
         let base_w: i32 = blk * 32
         let base_a: i32 = blk * 128
 
-        // Two 16-byte halves of the 32-byte packed weight block
-        // Activation groups span 32 elements each: [0..31], [32..63], [64..95], [96..127]
         let mut half: i32 = 0
         while half < 2 {
             let pw: i32 = base_w + half * 16
@@ -41,35 +40,29 @@ export func i2_dot_i8(
 
             let packed: u8x16 = load(weights, pw)
 
-            // Unpack 4 groups of 2-bit weights
-            let g0: u8x16 = (packed .>> s6) .& mask
-            let g1: u8x16 = (packed .>> s4) .& mask
-            let g2: u8x16 = (packed .>> s2) .& mask
-            let g3: u8x16 = packed .& mask
-
-            // Load 16 activations from each 32-element group
             let a0: i8x16 = load(activations, base_a + off)
             let a1: i8x16 = load(activations, base_a + 32 + off)
             let a2: i8x16 = load(activations, base_a + 64 + off)
             let a3: i8x16 = load(activations, base_a + 96 + off)
 
-            // maddubs_i32: u8×i8 pairwise multiply-add → i32x4 (overflow-safe)
-            acc = acc .+ maddubs_i32(g0, a0)
-            acc = acc .+ maddubs_i32(g1, a1)
-            acc = acc .+ maddubs_i32(g2, a2)
-            acc = acc .+ maddubs_i32(g3, a3)
+            // Alternate between acc_a and acc_b to break dependency chain
+            acc_a = acc_a .+ maddubs_i32((packed .>> s6) .& mask, a0)
+            acc_b = acc_b .+ maddubs_i32((packed .>> s4) .& mask, a1)
+            acc_a = acc_a .+ maddubs_i32((packed .>> s2) .& mask, a2)
+            acc_b = acc_b .+ maddubs_i32(packed .& mask, a3)
 
             half = half + 1
         }
         blk = blk + 1
     }
 
-    return reduce_add(acc)
+    return reduce_add(acc_a .+ acc_b)
 }
 
-// Multi-row dot product: 4 weight rows × one activation vector
-// Replaces ggml_vec_dot_i2_i8_s_1xN (~200 lines of C intrinsics)
-// Each row has independent packed weights, all share the same activations.
+// Multi-row dot product: 4 weight rows × one activation vector.
+// Group-first interleaving: process each bit-group across all 4 rows
+// before moving to the next group. This gives 4-way ILP — between
+// consecutive writes to r0, three independent ops on r1/r2/r3 execute.
 export func i2_dot_i8_4row(
     rw0: *restrict u8,
     rw1: *restrict u8,
@@ -99,38 +92,39 @@ export func i2_dot_i8_4row(
             let pw: i32 = bw + half * 16
             let off: i32 = half * 16
 
-            // Load activations once, reuse across all 4 rows
             let a0: i8x16 = load(activations, ba + off)
             let a1: i8x16 = load(activations, ba + 32 + off)
             let a2: i8x16 = load(activations, ba + 64 + off)
             let a3: i8x16 = load(activations, ba + 96 + off)
 
-            // Row 0
+            // Load all 4 packed weights upfront
             let p0: u8x16 = load(rw0, pw)
-            r0 = r0 .+ maddubs_i32((p0 .>> s6) .& mask, a0)
-            r0 = r0 .+ maddubs_i32((p0 .>> s4) .& mask, a1)
-            r0 = r0 .+ maddubs_i32((p0 .>> s2) .& mask, a2)
-            r0 = r0 .+ maddubs_i32(p0 .& mask, a3)
-
-            // Row 1
             let p1: u8x16 = load(rw1, pw)
-            r1 = r1 .+ maddubs_i32((p1 .>> s6) .& mask, a0)
-            r1 = r1 .+ maddubs_i32((p1 .>> s4) .& mask, a1)
-            r1 = r1 .+ maddubs_i32((p1 .>> s2) .& mask, a2)
-            r1 = r1 .+ maddubs_i32(p1 .& mask, a3)
-
-            // Row 2
             let p2: u8x16 = load(rw2, pw)
-            r2 = r2 .+ maddubs_i32((p2 .>> s6) .& mask, a0)
-            r2 = r2 .+ maddubs_i32((p2 .>> s4) .& mask, a1)
-            r2 = r2 .+ maddubs_i32((p2 .>> s2) .& mask, a2)
-            r2 = r2 .+ maddubs_i32(p2 .& mask, a3)
-
-            // Row 3
             let p3: u8x16 = load(rw3, pw)
+
+            // Group 0 (bits 7:6) across all rows — 4-way ILP
+            r0 = r0 .+ maddubs_i32((p0 .>> s6) .& mask, a0)
+            r1 = r1 .+ maddubs_i32((p1 .>> s6) .& mask, a0)
+            r2 = r2 .+ maddubs_i32((p2 .>> s6) .& mask, a0)
             r3 = r3 .+ maddubs_i32((p3 .>> s6) .& mask, a0)
+
+            // Group 1 (bits 5:4) across all rows
+            r0 = r0 .+ maddubs_i32((p0 .>> s4) .& mask, a1)
+            r1 = r1 .+ maddubs_i32((p1 .>> s4) .& mask, a1)
+            r2 = r2 .+ maddubs_i32((p2 .>> s4) .& mask, a1)
             r3 = r3 .+ maddubs_i32((p3 .>> s4) .& mask, a1)
+
+            // Group 2 (bits 3:2) across all rows
+            r0 = r0 .+ maddubs_i32((p0 .>> s2) .& mask, a2)
+            r1 = r1 .+ maddubs_i32((p1 .>> s2) .& mask, a2)
+            r2 = r2 .+ maddubs_i32((p2 .>> s2) .& mask, a2)
             r3 = r3 .+ maddubs_i32((p3 .>> s2) .& mask, a2)
+
+            // Group 3 (bits 1:0) across all rows
+            r0 = r0 .+ maddubs_i32(p0 .& mask, a3)
+            r1 = r1 .+ maddubs_i32(p1 .& mask, a3)
+            r2 = r2 .+ maddubs_i32(p2 .& mask, a3)
             r3 = r3 .+ maddubs_i32(p3 .& mask, a3)
 
             half = half + 1
@@ -145,8 +139,8 @@ export func i2_dot_i8_4row(
 }
 
 // Fused dual 4-row dot product: 4 gate rows + 4 up rows × shared activations.
-// Loads activations once per block, computes both projections simultaneously.
-// 8 accumulators (tight register pressure — 16 XMM used).
+// Gate/up interleaving: for each row pair, alternate gate and up ops so the
+// CPU pipelines independent accumulator chains (g_i and u_i are independent).
 export func i2_dot_i8_4row_dual(
     gw0: *restrict u8, gw1: *restrict u8, gw2: *restrict u8, gw3: *restrict u8,
     uw0: *restrict u8, uw1: *restrict u8, uw2: *restrict u8, uw3: *restrict u8,
@@ -179,66 +173,57 @@ export func i2_dot_i8_4row_dual(
             let pw: i32 = bw + half * 16
             let off: i32 = half * 16
 
-            // Load activations once — shared across all 8 rows
             let a0: i8x16 = load(activations, ba + off)
             let a1: i8x16 = load(activations, ba + 32 + off)
             let a2: i8x16 = load(activations, ba + 64 + off)
             let a3: i8x16 = load(activations, ba + 96 + off)
 
-            // Gate row 0
+            // Row 0: interleave gate/up for 2-way ILP
             let pg0: u8x16 = load(gw0, pw)
-            g0 = g0 .+ maddubs_i32((pg0 .>> s6) .& mask, a0)
-            g0 = g0 .+ maddubs_i32((pg0 .>> s4) .& mask, a1)
-            g0 = g0 .+ maddubs_i32((pg0 .>> s2) .& mask, a2)
-            g0 = g0 .+ maddubs_i32(pg0 .& mask, a3)
-
-            // Gate row 1
-            let pg1: u8x16 = load(gw1, pw)
-            g1 = g1 .+ maddubs_i32((pg1 .>> s6) .& mask, a0)
-            g1 = g1 .+ maddubs_i32((pg1 .>> s4) .& mask, a1)
-            g1 = g1 .+ maddubs_i32((pg1 .>> s2) .& mask, a2)
-            g1 = g1 .+ maddubs_i32(pg1 .& mask, a3)
-
-            // Gate row 2
-            let pg2: u8x16 = load(gw2, pw)
-            g2 = g2 .+ maddubs_i32((pg2 .>> s6) .& mask, a0)
-            g2 = g2 .+ maddubs_i32((pg2 .>> s4) .& mask, a1)
-            g2 = g2 .+ maddubs_i32((pg2 .>> s2) .& mask, a2)
-            g2 = g2 .+ maddubs_i32(pg2 .& mask, a3)
-
-            // Gate row 3
-            let pg3: u8x16 = load(gw3, pw)
-            g3 = g3 .+ maddubs_i32((pg3 .>> s6) .& mask, a0)
-            g3 = g3 .+ maddubs_i32((pg3 .>> s4) .& mask, a1)
-            g3 = g3 .+ maddubs_i32((pg3 .>> s2) .& mask, a2)
-            g3 = g3 .+ maddubs_i32(pg3 .& mask, a3)
-
-            // Up row 0
             let pu0: u8x16 = load(uw0, pw)
+            g0 = g0 .+ maddubs_i32((pg0 .>> s6) .& mask, a0)
             u0 = u0 .+ maddubs_i32((pu0 .>> s6) .& mask, a0)
+            g0 = g0 .+ maddubs_i32((pg0 .>> s4) .& mask, a1)
             u0 = u0 .+ maddubs_i32((pu0 .>> s4) .& mask, a1)
+            g0 = g0 .+ maddubs_i32((pg0 .>> s2) .& mask, a2)
             u0 = u0 .+ maddubs_i32((pu0 .>> s2) .& mask, a2)
+            g0 = g0 .+ maddubs_i32(pg0 .& mask, a3)
             u0 = u0 .+ maddubs_i32(pu0 .& mask, a3)
 
-            // Up row 1
+            // Row 1
+            let pg1: u8x16 = load(gw1, pw)
             let pu1: u8x16 = load(uw1, pw)
+            g1 = g1 .+ maddubs_i32((pg1 .>> s6) .& mask, a0)
             u1 = u1 .+ maddubs_i32((pu1 .>> s6) .& mask, a0)
+            g1 = g1 .+ maddubs_i32((pg1 .>> s4) .& mask, a1)
             u1 = u1 .+ maddubs_i32((pu1 .>> s4) .& mask, a1)
+            g1 = g1 .+ maddubs_i32((pg1 .>> s2) .& mask, a2)
             u1 = u1 .+ maddubs_i32((pu1 .>> s2) .& mask, a2)
+            g1 = g1 .+ maddubs_i32(pg1 .& mask, a3)
             u1 = u1 .+ maddubs_i32(pu1 .& mask, a3)
 
-            // Up row 2
+            // Row 2
+            let pg2: u8x16 = load(gw2, pw)
             let pu2: u8x16 = load(uw2, pw)
+            g2 = g2 .+ maddubs_i32((pg2 .>> s6) .& mask, a0)
             u2 = u2 .+ maddubs_i32((pu2 .>> s6) .& mask, a0)
+            g2 = g2 .+ maddubs_i32((pg2 .>> s4) .& mask, a1)
             u2 = u2 .+ maddubs_i32((pu2 .>> s4) .& mask, a1)
+            g2 = g2 .+ maddubs_i32((pg2 .>> s2) .& mask, a2)
             u2 = u2 .+ maddubs_i32((pu2 .>> s2) .& mask, a2)
+            g2 = g2 .+ maddubs_i32(pg2 .& mask, a3)
             u2 = u2 .+ maddubs_i32(pu2 .& mask, a3)
 
-            // Up row 3
+            // Row 3
+            let pg3: u8x16 = load(gw3, pw)
             let pu3: u8x16 = load(uw3, pw)
+            g3 = g3 .+ maddubs_i32((pg3 .>> s6) .& mask, a0)
             u3 = u3 .+ maddubs_i32((pu3 .>> s6) .& mask, a0)
+            g3 = g3 .+ maddubs_i32((pg3 .>> s4) .& mask, a1)
             u3 = u3 .+ maddubs_i32((pu3 .>> s4) .& mask, a1)
+            g3 = g3 .+ maddubs_i32((pg3 .>> s2) .& mask, a2)
             u3 = u3 .+ maddubs_i32((pu3 .>> s2) .& mask, a2)
+            g3 = g3 .+ maddubs_i32(pg3 .& mask, a3)
             u3 = u3 .+ maddubs_i32(pu3 .& mask, a3)
 
             half = half + 1
