@@ -5,3 +5,4 @@ build/
 *.ea.json
 target/
 CLAUDE.md
+autoresearch/
