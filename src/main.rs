@@ -6,6 +6,8 @@ mod gguf;
 mod matmul;
 mod matmul_q4k;
 mod matmul_q6k;
+mod gemm_q4k;
+mod gemm_q6k;
 mod model;
 mod repl;
 mod server;

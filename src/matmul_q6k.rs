@@ -14,7 +14,7 @@ const Q6K_SC_OFF: usize = 192;  // scales[16] (int8)
 const Q6K_D_OFF: usize = 208;   // d (f16, 2 bytes)
 
 /// Compute dot product of one Q6_K weight row against Q8_K activations.
-unsafe fn q6k_row_dot(
+pub(crate) unsafe fn q6k_row_dot(
     weight: *const u8,
     n_blocks: usize,
     q8_qs: *const i8,
@@ -42,7 +42,7 @@ unsafe fn q6k_row_dot(
 }
 
 /// 4-row Q6_K × Q8_K dot product with shared activations.
-unsafe fn q6k_4row_dot(
+pub(crate) unsafe fn q6k_4row_dot(
     w0: *const u8, w1: *const u8, w2: *const u8, w3: *const u8,
     n_blocks: usize,
     q8_qs: *const i8,

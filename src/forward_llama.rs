@@ -2,6 +2,8 @@
 
 use crate::ffi;
 use crate::forward::{apply_rope, build_rope_freqs, sample};
+use crate::gemm_q4k::{BatchQ8K, q4k_gemm_mt, q4k_fused_silu_gemm_mt};
+use crate::gemm_q6k::q6k_gemm_mt;
 use crate::matmul::embed_f16_lookup;
 use crate::matmul_q4k::{q4k_embed_lookup, q4k_matmul_mt, q4k_matmul_work, q4k_fused_gate_up_silu_work};
 use crate::matmul_q6k::{q6k_embed_lookup, q6k_matmul_mt, q6k_matmul_work};
@@ -241,24 +243,138 @@ impl LlamaState {
         self.output_proj(model);
     }
 
-    /// Batched prefill: processes all prompt tokens layer-by-layer.
-    /// Weights stay in L2/L3 cache across tokens within each layer.
+    /// GEMM-style batched prefill: load weight once, multiply all tokens.
     pub fn prefill(&mut self, model: &BitNetModel, tokens: &[u32]) {
+        let n = tokens.len();
         let h = model.hidden_dim;
+        let hd = model.head_dim;
+        let nh = model.n_heads;
+        let nkv = model.n_kv_heads;
+        let kv = model.kv_dim;
+        let f = model.ffn_dim;
+        let gqa_ratio = nh / nkv;
+        let h_nb = q8k_blocks(h);
+        let f_nb = q8k_blocks(f);
+        let h_row_stride = h_nb * Q4K_BLOCK_BYTES;
+
+        // Per-token hidden states
         let mut xs: Vec<Vec<f32>> = tokens.iter().map(|&tok| {
             let mut x = vec![0.0f32; h];
             embed_token(model, tok, &mut x);
             x
         }).collect();
 
+        // Batch buffers
+        let mut bq_h = BatchQ8K::new(n, h);
+        let mut bq_f = BatchQ8K::new(n, f);
+        let mut qs_all = vec![0.0f32; n * h];
+        let mut ks_all = vec![0.0f32; n * kv];
+        let mut vs_all = vec![0.0f32; n * kv];
+        let mut attn_all = vec![0.0f32; n * h];
+        let mut tmp_all = vec![0.0f32; n * h];
+        let mut hidden_all = vec![0.0f32; n * f];
+
         for layer in 0..model.n_layers {
-            for (pos, x) in xs.iter_mut().enumerate() {
-                self.process_layer(model, layer, x, pos);
+            let lw = &model.q4k_layers[layer];
+
+            // Phase A: batch RMSNorm + Q8K quantize
+            for t in 0..n {
+                unsafe {
+                    ffi::rmsnorm_f32(xs[t].as_ptr(), lw.attn_norm,
+                        self.x_norm.as_mut_ptr(), h as i32, model.rms_eps);
+                }
+                bq_h.quantize(t, &self.x_norm);
+            }
+
+            // Phase B: GEMM for Q, K, V
+            q4k_gemm_mt(lw.wq, h_row_stride, h_nb, &bq_h, &mut qs_all, h, &self.pool);
+            q4k_gemm_mt(lw.wk, h_row_stride, h_nb, &bq_h, &mut ks_all, kv, &self.pool);
+            if lw.wv_block_bytes == Q6K_BLOCK_BYTES {
+                q6k_gemm_mt(lw.wv, h_nb * Q6K_BLOCK_BYTES, h_nb, &bq_h, &mut vs_all, kv, &self.pool);
+            } else {
+                q4k_gemm_mt(lw.wv, h_row_stride, h_nb, &bq_h, &mut vs_all, kv, &self.pool);
+            }
+
+            // Phase C: RoPE + KV cache + attention (sequential per token)
+            for t in 0..n {
+                let q = &mut qs_all[t * h..(t + 1) * h];
+                let k = &mut ks_all[t * kv..(t + 1) * kv];
+                let v = &vs_all[t * kv..(t + 1) * kv];
+                build_rope_freqs(&mut self.rope_freqs, hd, t, model.rope_theta);
+                apply_rope(q, &self.rope_freqs, hd, nh);
+                apply_rope(k, &self.rope_freqs, hd, nkv);
+                for head in 0..nkv {
+                    let off = ((layer * nkv + head) * self.max_seq_len + t) * hd;
+                    self.k_cache[off..off + hd].copy_from_slice(&k[head * hd..(head + 1) * hd]);
+                    self.v_cache[off..off + hd].copy_from_slice(&v[head * hd..(head + 1) * hd]);
+                }
+                let scale = 1.0 / (hd as f32).sqrt();
+                let attn = &mut attn_all[t * h..(t + 1) * h];
+                for head in 0..nh {
+                    let kv_head = head / gqa_ratio;
+                    let q_off = head * hd;
+                    let cache_base = (layer * nkv + kv_head) * self.max_seq_len * hd;
+                    unsafe {
+                        ffi::fused_attention_f32(
+                            q.as_ptr().add(q_off),
+                            self.k_cache.as_ptr().add(cache_base),
+                            self.v_cache.as_ptr().add(cache_base),
+                            attn.as_mut_ptr().add(q_off),
+                            hd as i32, (t + 1) as i32, scale,
+                        );
+                    }
+                }
+            }
+
+            // Phase D: batch O projection
+            for t in 0..n {
+                let attn = &attn_all[t * h..(t + 1) * h];
+                unsafe {
+                    ffi::quant_f32_q8k(attn.as_ptr(), self.x_q8_qs.as_mut_ptr(),
+                        self.x_q8_d.as_mut_ptr(), self.x_q8_bsums.as_mut_ptr(), h as i32);
+                }
+                bq_h.quantize(t, attn);
+            }
+            q4k_gemm_mt(lw.wo, h_row_stride, h_nb, &bq_h, &mut tmp_all, h, &self.pool);
+            for t in 0..n {
+                unsafe {
+                    ffi::vecadd_f32(xs[t].as_ptr(), tmp_all[t * h..].as_ptr(),
+                        xs[t].as_mut_ptr(), h as i32);
+                }
+            }
+
+            // Phase E: batch FFN
+            for t in 0..n {
+                unsafe {
+                    ffi::rmsnorm_f32(xs[t].as_ptr(), lw.ffn_norm,
+                        self.x_norm.as_mut_ptr(), h as i32, model.rms_eps);
+                }
+                bq_h.quantize(t, &self.x_norm);
+            }
+            q4k_fused_silu_gemm_mt(lw.w_gate, lw.w_up, h_row_stride, h_nb,
+                &bq_h, &mut hidden_all, f, &self.pool);
+            for t in 0..n {
+                let hid = &hidden_all[t * f..(t + 1) * f];
+                unsafe {
+                    ffi::quant_f32_q8k(hid.as_ptr(), self.hidden_q8_qs.as_mut_ptr(),
+                        self.hidden_q8_d.as_mut_ptr(), self.hidden_q8_bsums.as_mut_ptr(), f as i32);
+                }
+                bq_f.quantize(t, hid);
+            }
+            if lw.w_down_block_bytes == Q6K_BLOCK_BYTES {
+                q6k_gemm_mt(lw.w_down, f_nb * Q6K_BLOCK_BYTES, f_nb, &bq_f, &mut tmp_all, h, &self.pool);
+            } else {
+                q4k_gemm_mt(lw.w_down, f_nb * Q4K_BLOCK_BYTES, f_nb, &bq_f, &mut tmp_all, h, &self.pool);
+            }
+            for t in 0..n {
+                unsafe {
+                    ffi::vecadd_f32(xs[t].as_ptr(), tmp_all[t * h..].as_ptr(),
+                        xs[t].as_mut_ptr(), h as i32);
+                }
             }
         }
 
-        // Copy last token's state for output projection + subsequent decode
-        self.x[..h].copy_from_slice(&xs[tokens.len() - 1]);
+        self.x[..h].copy_from_slice(&xs[n - 1]);
         self.output_proj(model);
     }
 

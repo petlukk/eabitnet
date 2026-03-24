@@ -29,7 +29,7 @@ pub(crate) fn unpack_q4k_scales(packed: &[u8], scales: &mut [u8; 8], mins: &mut 
 /// Iterates over super-blocks, unpacking per-block scales and d/dmin,
 /// then calls the SIMD kernel with n_blocks=1 per block (since d/dmin
 /// vary per block).
-unsafe fn q4k_row_dot(
+pub(crate) unsafe fn q4k_row_dot(
     weight: *const u8,
     n_blocks: usize,
     q8_qs: *const i8,
@@ -72,7 +72,7 @@ unsafe fn q4k_row_dot(
 ///
 /// Same per-block iteration as `q4k_row_dot`, but uses the 4-row kernel
 /// to share Q8 loads across rows.
-unsafe fn q4k_4row_dot(
+pub(crate) unsafe fn q4k_4row_dot(
     w0: *const u8, w1: *const u8, w2: *const u8, w3: *const u8,
     n_blocks: usize,
     q8_qs: *const i8,
@@ -341,7 +341,7 @@ pub(crate) unsafe fn q4k_matmul_work(
 
 /// Fused 4-row gate+up dot product using dual kernel.
 /// Computes both projections per block — Q8K stays in SIMD registers.
-unsafe fn q4k_dual_4row_dot(
+pub(crate) unsafe fn q4k_dual_4row_dot(
     gw0: *const u8, gw1: *const u8, gw2: *const u8, gw3: *const u8,
     uw0: *const u8, uw1: *const u8, uw2: *const u8, uw3: *const u8,
     n_blocks: usize,
