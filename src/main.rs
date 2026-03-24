@@ -1,6 +1,7 @@
 mod embed;
 mod ffi;
 mod forward;
+mod forward_llama;
 mod gguf;
 mod matmul;
 mod matmul_q4k;
@@ -120,17 +121,23 @@ fn main() {
     );
     eprintln!("cougar> quant: {:?}, activation: {:?}", model.quant_type, model.activation);
 
-    if model.quant_type == model::QuantType::Q4K {
-        die("Q4_K_M inference not yet implemented — coming in v0.3.0");
-    }
+    let is_q4k = model.quant_type == model::QuantType::Q4K;
 
     if serve {
-        server::run(&model, &tokenizer, max_tokens, temperature, repetition_penalty, max_seq_len, port);
+        if is_q4k {
+            server::run_q4k(&model, &tokenizer, max_tokens, temperature, repetition_penalty, max_seq_len, port);
+        } else {
+            server::run(&model, &tokenizer, max_tokens, temperature, repetition_penalty, max_seq_len, port);
+        }
         return;
     }
 
     if interactive {
-        repl::run(&model, &tokenizer, max_tokens, temperature, repetition_penalty, max_seq_len);
+        if is_q4k {
+            repl::run_q4k(&model, &tokenizer, max_tokens, temperature, repetition_penalty, max_seq_len);
+        } else {
+            repl::run(&model, &tokenizer, max_tokens, temperature, repetition_penalty, max_seq_len);
+        }
         return;
     }
 
@@ -143,12 +150,21 @@ fn main() {
     tokens.extend(tokenizer.encode(&prompt_text));
     eprintln!("cougar> prompt: {} tokens", tokens.len());
 
-    let (output, _prefill_ms, _decode_ms) = InferenceState::generate(
-        &model, &tokens, max_tokens, temperature, repetition_penalty,
-        tokenizer.eos_id, max_seq_len, |_| {},
-    );
-
-    let generated = &output[tokens.len()..];
-    let text = tokenizer.decode(generated);
-    println!("{text}");
+    if is_q4k {
+        let (output, _, _) = forward_llama::generate(
+            &model, &tokens, max_tokens, temperature, repetition_penalty,
+            tokenizer.eos_id, max_seq_len, |_| {},
+        );
+        let generated = &output[tokens.len()..];
+        let text = tokenizer.decode(generated);
+        println!("{text}");
+    } else {
+        let (output, _, _) = InferenceState::generate(
+            &model, &tokens, max_tokens, temperature, repetition_penalty,
+            tokenizer.eos_id, max_seq_len, |_| {},
+        );
+        let generated = &output[tokens.len()..];
+        let text = tokenizer.decode(generated);
+        println!("{text}");
+    }
 }

@@ -1,6 +1,7 @@
 //! Minimal HTTP server with SSE streaming for web chat UI.
 
 use crate::forward::InferenceState;
+use crate::forward_llama;
 use crate::model::BitNetModel;
 use crate::tokenizer::Tokenizer;
 use std::io::{Read, Write};
@@ -15,6 +16,31 @@ pub fn run(
     repetition_penalty: f32,
     max_seq_len: usize,
     port: u16,
+) {
+    run_inner(model, tokenizer, max_tokens, temperature, repetition_penalty, max_seq_len, port, false);
+}
+
+pub fn run_q4k(
+    model: &BitNetModel,
+    tokenizer: &Tokenizer,
+    max_tokens: usize,
+    temperature: f32,
+    repetition_penalty: f32,
+    max_seq_len: usize,
+    port: u16,
+) {
+    run_inner(model, tokenizer, max_tokens, temperature, repetition_penalty, max_seq_len, port, true);
+}
+
+fn run_inner(
+    model: &BitNetModel,
+    tokenizer: &Tokenizer,
+    max_tokens: usize,
+    temperature: f32,
+    repetition_penalty: f32,
+    max_seq_len: usize,
+    port: u16,
+    use_q4k: bool,
 ) {
     let addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&addr).unwrap_or_else(|e| {
@@ -104,20 +130,27 @@ pub fn run(
                     let gen_start = Instant::now();
                     let mut gen_count = 0u64;
 
-                    let (_output, _pf, _dc) = InferenceState::generate(
-                        model, &tokens, req_max, req_temp, req_rep,
-                        tokenizer.eos_id, max_seq_len,
-                        |tok_id| {
-                            gen_count += 1;
-                            let text = tokenizer.decode(&[tok_id]);
-                            let elapsed = gen_start.elapsed().as_secs_f64();
-                            let tps = if elapsed > 0.0 { gen_count as f64 / elapsed } else { 0.0 };
-                            let escaped = escape_json(&text);
-                            let _ = write!(stream,
-                                "data: {{\"token\":\"{escaped}\",\"tps\":{tps:.1}}}\n\n");
-                            let _ = stream.flush();
-                        },
-                    );
+                    let on_tok = |tok_id: u32| {
+                        gen_count += 1;
+                        let text = tokenizer.decode(&[tok_id]);
+                        let elapsed = gen_start.elapsed().as_secs_f64();
+                        let tps = if elapsed > 0.0 { gen_count as f64 / elapsed } else { 0.0 };
+                        let escaped = escape_json(&text);
+                        let _ = write!(stream,
+                            "data: {{\"token\":\"{escaped}\",\"tps\":{tps:.1}}}\n\n");
+                        let _ = stream.flush();
+                    };
+                    if use_q4k {
+                        let _ = forward_llama::generate(
+                            model, &tokens, req_max, req_temp, req_rep,
+                            tokenizer.eos_id, max_seq_len, on_tok,
+                        );
+                    } else {
+                        let _ = InferenceState::generate(
+                            model, &tokens, req_max, req_temp, req_rep,
+                            tokenizer.eos_id, max_seq_len, on_tok,
+                        );
+                    }
                     let _ = write!(stream, "data: [DONE]\n\n");
                     let _ = stream.flush();
                 }

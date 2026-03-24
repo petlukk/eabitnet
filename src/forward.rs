@@ -27,7 +27,7 @@ pub struct InferenceState {
     max_seq_len: usize,
 }
 
-fn build_rope_freqs(freqs: &mut [f32], head_dim: usize, pos: usize, theta: f32) {
+pub(crate) fn build_rope_freqs(freqs: &mut [f32], head_dim: usize, pos: usize, theta: f32) {
     for i in 0..head_dim / 2 {
         let angle = pos as f32 / theta.powf(2.0 * i as f32 / head_dim as f32);
         freqs[2 * i] = angle.cos();
@@ -35,7 +35,7 @@ fn build_rope_freqs(freqs: &mut [f32], head_dim: usize, pos: usize, theta: f32) 
     }
 }
 
-fn apply_rope(data: &mut [f32], freqs: &[f32], head_dim: usize, n_heads: usize) {
+pub(crate) fn apply_rope(data: &mut [f32], freqs: &[f32], head_dim: usize, n_heads: usize) {
     for h in 0..n_heads {
         let off = h * head_dim;
         for i in 0..head_dim / 2 {
@@ -49,12 +49,12 @@ fn apply_rope(data: &mut [f32], freqs: &[f32], head_dim: usize, n_heads: usize) 
     }
 }
 
-fn argmax(s: &[f32]) -> u32 {
+pub(crate) fn argmax(s: &[f32]) -> u32 {
     s.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
         .map(|(i, _)| i as u32).unwrap_or(0)
 }
 
-fn sample(logits: &[f32], temperature: f32) -> u32 {
+pub(crate) fn sample(logits: &[f32], temperature: f32) -> u32 {
     if temperature <= 0.0 { return argmax(logits); }
 
     // Softmax with temperature scaling
@@ -74,7 +74,7 @@ fn sample(logits: &[f32], temperature: f32) -> u32 {
 }
 
 /// Xorshift64 RNG returning f32 in [0, 1). Seeded from system time on first call.
-fn xorshift_f32() -> f32 {
+pub(crate) fn xorshift_f32() -> f32 {
     use std::cell::Cell;
     thread_local! {
         static STATE: Cell<u64> = Cell::new(0);
