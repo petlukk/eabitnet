@@ -1,3 +1,4 @@
+mod embed;
 mod ffi;
 mod forward;
 mod gguf;
@@ -11,6 +12,11 @@ use model::BitNetModel;
 use tokenizer::Tokenizer;
 
 fn main() {
+    embed::init().unwrap_or_else(|e| {
+        eprintln!("Failed to load kernels: {e}");
+        std::process::exit(1);
+    });
+
     let args: Vec<String> = std::env::args().collect();
 
     let mut model_path = None;
