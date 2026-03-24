@@ -1,7 +1,7 @@
 ```
         /\_/\
        ( o.o )  ╔═══════════════════════════════════╗
-        > ^ <   ║  C O U G A R                      ║
+        >╥╥<    ║  C O U G A R                      ║
        /|   |\  ║  BitNet b1.58 inference engine     ║
       (_|   |_) ╚═══════════════════════════════════╝
 ```
@@ -10,9 +10,9 @@
 
 Llama.cpp is a beast, but even beasts have predators. 🐾
 
-A ~3,600-line BitNet b1.58 engine written in Rust + [Eä](https://github.com/petlukk/eacompute) SIMD kernels. No llama.cpp. No dependencies.
+A ~4,300-line BitNet b1.58 engine written in Rust + [Eä](https://github.com/petlukk/eacompute) SIMD kernels. No llama.cpp. No dependencies. Single binary with embedded kernels, interactive REPL, and web chat UI.
 
-🚀 **18.8 tok/s** (AVX2 / 16 threads) · 📦 **644 KB** binary · 🚫 Zero dependencies
+🚀 **18.8 tok/s** (AVX2 / 16 threads) · 📦 **869 KB** binary (kernels embedded) · 🚫 Zero dependencies
 
 It doesn't just run models. It hunts them.
 
@@ -22,13 +22,19 @@ It doesn't just run models. It hunts them.
 # Build kernels (needs eacompute compiler)
 make kernels
 
-# Build runner
-RUSTFLAGS="-L build/lib" cargo build --release
+# Build (kernels embedded in binary — no LD_LIBRARY_PATH needed)
+cargo build --release
 
-# Run
-LD_LIBRARY_PATH=build/lib ./target/release/cougar \
-  --model path/to/ggml-model-i2_s.gguf \
+# Single prompt
+./target/release/cougar --model path/to/ggml-model-i2_s.gguf \
   --prompt "The capital of France is"
+
+# Interactive chat
+./target/release/cougar --model path/to/ggml-model-i2_s.gguf --interactive
+
+# Web chat UI
+./target/release/cougar --model path/to/ggml-model-i2_s.gguf --serve
+# Open http://localhost:8080
 ```
 
 ## What it does
@@ -51,7 +57,7 @@ BitNet b1.58 2B-4T (30 layers, 2560 hidden, 20 heads, 128K vocab) on x86-64:
 | Decode latency | **53.3 ms/tok** |
 | Prefill throughput | 17.6 tok/s |
 | Threads | 16 |
-| Binary size | 644 KB |
+| Binary size | 869 KB (kernels embedded) |
 | Model RSS | ~2.0 GB |
 
 ### Optimization history
@@ -96,9 +102,10 @@ attention:     0.2ms          fused online softmax
 
 ```
 cougar/
-  kernels/    8 Ea kernels (.ea -> .so via eacompute)
-  src/        8 Rust modules + test files (71 tests)
+  kernels/    8 Ea kernels (.ea -> .so, embedded in binary)
+  src/        11 Rust modules + test files (70 tests)
   tests/      13 C test harnesses (102 tests)
+  build.rs    kernel embedding + ABI hash
 ```
 
 The model runs BitNet b1.58 2B-4T with:
@@ -136,12 +143,17 @@ The point of cougar is proving the **inference engine**, not the model. If you w
 
 ```
 cougar --model <path.gguf> --prompt <text> [options]
+cougar --model <path.gguf> --interactive [options]
+cougar --model <path.gguf> --serve [--port 8080] [options]
 
 Options:
   --max-tokens N          Maximum tokens to generate (default: 128)
   --temperature T         Sampling temperature, 0 = greedy (default: 0)
   --repetition-penalty F  Penalize repeated tokens (default: 1.1)
   --max-seq-len N         Maximum sequence length (default: 2048)
+  --interactive           Interactive REPL mode
+  --serve                 Web chat UI (SSE streaming)
+  --port N                Server port (default: 8080)
 ```
 
 ## Building
@@ -158,34 +170,11 @@ cd ~/projects/eacompute && cargo build --release --features=llvm
 
 # Build cougar
 cd ~/projects/cougar
-make kernels                              # compile .ea -> .so
-RUSTFLAGS="-L build/lib" cargo build --release
-make test                                 # 102 kernel tests
-RUSTFLAGS="-L build/lib" cargo test       # 71 Rust tests
+make kernels                    # compile .ea -> .so
+cargo build --release           # kernels embedded in binary
+cargo test                      # 70 Rust tests
 ```
 
-### Linking note
+### Kernel embedding
 
-The Ea kernels compile to shared libraries (`.so` files) in `build/lib/`. Both the Rust compiler and the runtime need to find them:
-
-```bash
-# At compile time — tell rustc where to find the .so files
-RUSTFLAGS="-L build/lib" cargo build --release
-
-# At runtime — tell the dynamic linker where to find them
-LD_LIBRARY_PATH=build/lib ./target/release/cougar --model ...
-```
-
-To avoid typing `LD_LIBRARY_PATH` every time, add the full path to your shell profile:
-
-```bash
-# Add to ~/.bashrc or ~/.zshrc
-export LD_LIBRARY_PATH="$HOME/projects/cougar/build/lib:$LD_LIBRARY_PATH"
-```
-
-Or install the libraries system-wide:
-
-```bash
-sudo cp build/lib/*.so /usr/local/lib/
-sudo ldconfig
-```
+Ea kernels are compiled to `.so` files by `make kernels`, then embedded in the binary via `include_bytes!` at build time. On first run, they're extracted to `~/.cougar/lib/v{VERSION}-{HASH}/` and loaded via `dlopen`. No `LD_LIBRARY_PATH` needed.
