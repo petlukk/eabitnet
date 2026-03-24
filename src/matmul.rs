@@ -80,7 +80,7 @@ pub(crate) fn i8_output_matmul_mt(
         let act = act_ptr as *const i8;
         let out = unsafe { std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(start), count) };
         let h = hidden_dim;
-        let mut raw = vec![0i32; 4];
+        let mut raw4 = [0i32; 4];
         let mut r = 0;
         while r + 4 <= count {
             let row = start + r;
@@ -89,12 +89,12 @@ pub(crate) fn i8_output_matmul_mt(
                     act,
                     embed.add(row * h), embed.add((row+1) * h),
                     embed.add((row+2) * h), embed.add((row+3) * h),
-                    raw.as_mut_ptr(), h as i32,
+                    raw4.as_mut_ptr(), h as i32,
                 );
             }
             for j in 0..4 {
                 let row_s = unsafe { *scales.add(row + j) };
-                let corrected = raw[j] - 128 * x_sum;
+                let corrected = raw4[j] - 128 * x_sum;
                 out[r + j] = corrected as f32 * x_scale * (row_s / 127.0);
             }
             r += 4;
@@ -118,9 +118,11 @@ pub(crate) fn ternary_matmul_mt_n(
     n_threads: usize, pool: &ThreadPool,
 ) {
     let n_threads = n_threads.min(out_dim / 4).max(1);
+    let row_bytes = in_dim / 4;
+    let scale = (act_scale / 127.0) * weight_scale;
+
     if n_threads <= 1 {
-        let row_bytes = in_dim / 4;
-        let mut raw = vec![0i32; out_dim];
+        let mut raw4 = [0i32; 4];
         let mut r = 0;
         unsafe {
             while r + 4 <= out_dim {
@@ -129,28 +131,26 @@ pub(crate) fn ternary_matmul_mt_n(
                     weight.add((r + 1) * row_bytes),
                     weight.add((r + 2) * row_bytes),
                     weight.add((r + 3) * row_bytes),
-                    act, raw[r..].as_mut_ptr(), in_dim as i32,
+                    act, raw4.as_mut_ptr(), in_dim as i32,
                 );
+                for j in 0..4 {
+                    out[r + j] = (raw4[j] - act_sum) as f32 * scale;
+                }
                 r += 4;
             }
             while r < out_dim {
-                raw[r] = ffi::i2_dot_i8(weight.add(r * row_bytes), act, in_dim as i32);
+                let v = ffi::i2_dot_i8(weight.add(r * row_bytes), act, in_dim as i32);
+                out[r] = (v - act_sum) as f32 * scale;
                 r += 1;
             }
-        }
-        let scale = (act_scale / 127.0) * weight_scale;
-        for i in 0..out_dim {
-            out[i] = (raw[i] - act_sum) as f32 * scale;
         }
         return;
     }
 
     let chunk = ((out_dim + n_threads - 1) / n_threads + 3) & !3;
-    let row_bytes = in_dim / 4;
     let weight_ptr = weight as usize;
     let act_ptr = act as usize;
     let out_ptr = out.as_mut_ptr() as usize;
-    let scale = (act_scale / 127.0) * weight_scale;
 
     pool.run(n_threads, |tid, _n_threads| {
         let start = tid * chunk;
@@ -164,7 +164,7 @@ pub(crate) fn ternary_matmul_mt_n(
         let out_slice = unsafe {
             std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(start), count)
         };
-        let mut raw = vec![0i32; count];
+        let mut raw4 = [0i32; 4];
         let mut r = 0;
         unsafe {
             while r + 4 <= count {
@@ -174,19 +174,20 @@ pub(crate) fn ternary_matmul_mt_n(
                     weight.add((row + 1) * row_bytes),
                     weight.add((row + 2) * row_bytes),
                     weight.add((row + 3) * row_bytes),
-                    act, raw[r..].as_mut_ptr(), in_dim as i32,
+                    act, raw4.as_mut_ptr(), in_dim as i32,
                 );
+                for j in 0..4 {
+                    out_slice[r + j] = (raw4[j] - act_sum) as f32 * scale;
+                }
                 r += 4;
             }
             while r < count {
-                raw[r] = ffi::i2_dot_i8(
+                let v = ffi::i2_dot_i8(
                     weight.add((start + r) * row_bytes), act, in_dim as i32,
                 );
+                out_slice[r] = (v - act_sum) as f32 * scale;
                 r += 1;
             }
-        }
-        for i in 0..count {
-            out_slice[i] = (raw[i] - act_sum) as f32 * scale;
         }
     });
 }
@@ -240,7 +241,7 @@ pub(crate) fn ternary_matmul_qkv(
                 std::slice::from_raw_parts_mut((out_ptr as *mut f32).add(start), count)
             };
             let combined_scale = (act_scale / 127.0) * scale;
-            let mut raw = vec![0i32; count];
+            let mut raw4 = [0i32; 4];
             let mut r = 0;
             unsafe {
                 while r + 4 <= count {
@@ -250,19 +251,20 @@ pub(crate) fn ternary_matmul_qkv(
                         weight.add((row + 1) * row_bytes),
                         weight.add((row + 2) * row_bytes),
                         weight.add((row + 3) * row_bytes),
-                        act, raw[r..].as_mut_ptr(), in_dim as i32,
+                        act, raw4.as_mut_ptr(), in_dim as i32,
                     );
+                    for j in 0..4 {
+                        out_slice[r + j] = (raw4[j] - act_sum) as f32 * combined_scale;
+                    }
                     r += 4;
                 }
                 while r < count {
-                    raw[r] = ffi::i2_dot_i8(
+                    let v = ffi::i2_dot_i8(
                         weight.add((start + r) * row_bytes), act, in_dim as i32,
                     );
+                    out_slice[r] = (v - act_sum) as f32 * combined_scale;
                     r += 1;
                 }
-            }
-            for i in 0..count {
-                out_slice[i] = (raw[i] - act_sum) as f32 * combined_scale;
             }
         }
     };
@@ -305,8 +307,8 @@ pub(crate) fn ternary_matmul_fused_pair(
         let act = act_ptr as *const i8;
         let oa = unsafe { std::slice::from_raw_parts_mut((oa_ptr as *mut f32).add(start), count) };
         let ob = unsafe { std::slice::from_raw_parts_mut((ob_ptr as *mut f32).add(start), count) };
-        let mut raw_a = vec![0i32; 4];
-        let mut raw_b = vec![0i32; 4];
+        let mut raw_a = [0i32; 4];
+        let mut raw_b = [0i32; 4];
         let mut r = 0;
         unsafe {
             while r + 4 <= count {
