@@ -67,8 +67,7 @@ impl Tokenizer {
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, String> {
         let tokens_arr = gguf.metadata.get("tokenizer.ggml.tokens")
             .ok_or("missing tokenizer.ggml.tokens")?;
-        let scores_arr = gguf.metadata.get("tokenizer.ggml.scores")
-            .ok_or("missing tokenizer.ggml.scores")?;
+        let scores_arr = gguf.metadata.get("tokenizer.ggml.scores");
 
         let token_strs = match tokens_arr {
             MetaValue::Array(arr) => {
@@ -85,7 +84,7 @@ impl Tokenizer {
         };
 
         let scores = match scores_arr {
-            MetaValue::Array(arr) => {
+            Some(MetaValue::Array(arr)) => {
                 let mut out = Vec::with_capacity(arr.len());
                 for v in arr {
                     match v {
@@ -95,7 +94,11 @@ impl Tokenizer {
                 }
                 out
             }
-            _ => return Err("tokenizer.ggml.scores is not an array".into()),
+            _ => {
+                // No scores (tiktoken/BPE models like Llama 3) — use token index as score
+                // Lower index = higher priority merge (reverse of sentencepiece convention)
+                (0..token_strs.len()).map(|i| -(i as f32)).collect()
+            }
         };
 
         if token_strs.len() != scores.len() {
