@@ -3,6 +3,7 @@ mod ffi;
 mod forward;
 mod gguf;
 mod matmul;
+mod matmul_q4k;
 mod model;
 mod repl;
 mod server;
