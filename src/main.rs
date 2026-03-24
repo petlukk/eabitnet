@@ -5,6 +5,7 @@ mod gguf;
 mod matmul;
 mod model;
 mod repl;
+mod server;
 mod threadpool;
 mod tokenizer;
 
@@ -23,6 +24,8 @@ fn main() {
     let mut model_path = None;
     let mut prompt = None;
     let mut interactive = false;
+    let mut serve = false;
+    let mut port: u16 = 8080;
     let mut max_tokens: usize = 128;
     let mut temperature: f32 = 0.0;
     let mut repetition_penalty: f32 = 1.1;
@@ -58,6 +61,13 @@ fn main() {
             "--interactive" => {
                 interactive = true;
             }
+            "--serve" => {
+                serve = true;
+            }
+            "--port" => {
+                i += 1;
+                port = args[i].parse().expect("invalid --port");
+            }
             other => {
                 eprintln!("Unknown argument: {other}");
                 std::process::exit(1);
@@ -67,11 +77,11 @@ fn main() {
     }
 
     let model_path = model_path.unwrap_or_else(|| {
-        eprintln!("Usage: cougar --model <path.gguf> [--prompt <text> | --interactive] [--max-tokens N] [--temperature T] [--repetition-penalty F]");
+        eprintln!("Usage: cougar --model <path.gguf> [--prompt <text> | --interactive | --serve] [--port P] [--max-tokens N] [--temperature T] [--repetition-penalty F]");
         std::process::exit(1);
     });
-    if !interactive && prompt.is_none() {
-        eprintln!("Usage: cougar --model <path.gguf> [--prompt <text> | --interactive]");
+    if !interactive && !serve && prompt.is_none() {
+        eprintln!("Usage: cougar --model <path.gguf> [--prompt <text> | --interactive | --serve]");
         std::process::exit(1);
     }
 
@@ -97,6 +107,11 @@ fn main() {
         "cougar> {} layers, {}d, {} heads, {} vocab",
         model.n_layers, model.hidden_dim, model.n_heads, model.vocab_size,
     );
+
+    if serve {
+        server::run(&model, &tokenizer, max_tokens, temperature, repetition_penalty, max_seq_len, port);
+        return;
+    }
 
     if interactive {
         repl::run(&model, &tokenizer, max_tokens, temperature, repetition_penalty, max_seq_len);
