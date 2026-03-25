@@ -383,7 +383,13 @@ impl InferenceState {
         let mut output = Vec::with_capacity(prompt_tokens.len() + max_tokens);
 
         let prefill_start = Instant::now();
-        state.prefill(model, prompt_tokens);
+        if prompt_tokens.len() >= 8 {
+            state.prefill(model, prompt_tokens);
+        } else {
+            for (i, &tok) in prompt_tokens.iter().enumerate() {
+                state.forward(model, tok, i);
+            }
+        }
         output.extend_from_slice(prompt_tokens);
         let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
 
