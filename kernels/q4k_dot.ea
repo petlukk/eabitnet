@@ -13,10 +13,9 @@
 
 #[cfg(x86_64)]
 
-// Single-row Q4_K × Q8_K dot product.
-// Returns d * sumi - dmin * summs where:
-//   sumi  = sum of (nibble * q8) weighted by sub-block scales
-//   summs = sum of mins * bsums (correction for Q4_K minimum offset)
+// Single-row Q4_K × Q8_K dot product (autoresearch-optimized).
+// Loads all q8+q4 per chunk upfront, fuses lo/hi maddubs with vector add
+// before reduce_add — eliminates serial half-loop dependency chain.
 export func q4k_dot_q8k(
     q4: *restrict u8,
     q8: *restrict i8,
@@ -40,39 +39,20 @@ export func q4k_dot_q8k(
 
         let mut sumi: i32 = 0
 
-        // 4 chunks of 64 elements each
         let mut j: i32 = 0
         while j < 4 {
-            // Low nibbles: q4[j*32..j*32+31] & 0x0F × q8[j*64..j*64+31]
-            let mut acc_lo: i32x4 = splat(0)
-            let mut half: i32 = 0
-            while half < 2 {
-                let q4v: u8x16 = load(q4, q4_off + j * 32 + half * 16)
-                let q4_lo: u8x16 = q4v .& mask_lo
-                let q8v: i8x16 = load(q8, q8_off + j * 64 + half * 16)
-                acc_lo = acc_lo .+ maddubs_i32(q4_lo, q8v)
-                half = half + 1
-            }
-            let sc_lo: i32 = to_i32(scales[sc_off + 2 * j])
-            sumi = sumi + reduce_add(acc_lo) * sc_lo
-
-            // High nibbles: q4[j*32..j*32+31] >> 4 × q8[j*64+32..j*64+63]
-            let mut acc_hi: i32x4 = splat(0)
-            half = 0
-            while half < 2 {
-                let q4v2: u8x16 = load(q4, q4_off + j * 32 + half * 16)
-                let q4_hi: u8x16 = q4v2 .>> shift4
-                let q8v2: i8x16 = load(q8, q8_off + j * 64 + 32 + half * 16)
-                acc_hi = acc_hi .+ maddubs_i32(q4_hi, q8v2)
-                half = half + 1
-            }
-            let sc_hi: i32 = to_i32(scales[sc_off + 2 * j + 1])
-            sumi = sumi + reduce_add(acc_hi) * sc_hi
-
+            let q8_a0: i8x16 = load(q8, q8_off + j * 64)
+            let q8_a1: i8x16 = load(q8, q8_off + j * 64 + 16)
+            let q8_b0: i8x16 = load(q8, q8_off + j * 64 + 32)
+            let q8_b1: i8x16 = load(q8, q8_off + j * 64 + 48)
+            let pa: u8x16 = load(q4, q4_off + j * 32)
+            let pb: u8x16 = load(q4, q4_off + j * 32 + 16)
+            let dot_lo: i32 = reduce_add(maddubs_i32(pa .& mask_lo, q8_a0) .+ maddubs_i32(pb .& mask_lo, q8_a1))
+            let dot_hi: i32 = reduce_add(maddubs_i32(pa .>> shift4, q8_b0) .+ maddubs_i32(pb .>> shift4, q8_b1))
+            sumi = sumi + dot_lo * to_i32(scales[sc_off + 2 * j]) + dot_hi * to_i32(scales[sc_off + 2 * j + 1])
             j = j + 1
         }
 
-        // Min correction: summs = sum of mins[j] * (bsums[2j] + bsums[2j+1])
         let mut summs: i32 = 0
         j = 0
         while j < 8 {
@@ -83,7 +63,6 @@ export func q4k_dot_q8k(
         }
 
         result = result + d * to_f32(sumi) - dmin * to_f32(summs)
-
         blk = blk + 1
     }
 
