@@ -1,0 +1,70 @@
+// rope.ea — Rotary Position Embedding (RoPE) application via SIMD
+//
+// Applies precomputed cos/sin rotation to Q or K vectors.
+// freqs layout: [cos_0, sin_0, cos_1, sin_1, ...] (head_dim values)
+// data layout:  [head0: r0, im0, r1, im1, ...][head1: ...] (n_heads * head_dim)
+//
+// Rotation per pair:
+//   out[2i]   = data[2i] * cos[i] - data[2i+1] * sin[i]
+//   out[2i+1] = data[2i] * sin[i] + data[2i+1] * cos[i]
+//
+// SIMD strategy: shuffle + fma. Load [r0, im0, r1, im1] and [cos0, sin0, cos1, sin1],
+// shuffle to duplicate r/im lanes, compute via fma with sign-flipped sin.
+
+#[cfg(x86_64)]
+
+export func apply_rope_f32(
+    data: *restrict f32,
+    freqs: *restrict f32,
+    out: *mut f32,
+    head_dim: i32,
+    n_heads: i32
+) {
+    let signs: f32x4 = [-1.0, 1.0, -1.0, 1.0]f32x4
+
+    let mut h: i32 = 0
+    while h < n_heads {
+        let off: i32 = h * head_dim
+        let mut i: i32 = 0
+
+        // Main SIMD loop: 2 complex rotations per f32x4
+        while i + 4 <= head_dim {
+            // d = [r0, im0, r1, im1]
+            let d: f32x4 = load(data, off + i)
+            // f = [cos0, sin0, cos1, sin1]
+            let f: f32x4 = load(freqs, i)
+
+            // Duplicate real parts: [r0, r0, r1, r1]
+            let r_dup: f32x4 = shuffle(d, [0, 0, 2, 2])
+            // Duplicate imag parts: [im0, im0, im1, im1]
+            let im_dup: f32x4 = shuffle(d, [1, 1, 3, 3])
+
+            // Swap cos/sin: [sin0, cos0, sin1, cos1]
+            let f_swap: f32x4 = shuffle(f, [1, 0, 3, 2])
+            // Negate sin lanes: [-sin0, cos0, -sin1, cos1]
+            let f_neg: f32x4 = f_swap .* signs
+
+            // result = r_dup * f + im_dup * f_neg
+            //   [0]: r0*cos0 + im0*(-sin0) = r0*cos0 - im0*sin0
+            //   [1]: r0*sin0 + im0*cos0
+            //   [2]: r1*cos1 + im1*(-sin1) = r1*cos1 - im1*sin1
+            //   [3]: r1*sin1 + im1*cos1
+            store(out, off + i, fma(im_dup, f_neg, r_dup .* f))
+
+            i = i + 4
+        }
+
+        // Scalar cleanup for remaining pair
+        while i + 2 <= head_dim {
+            let r: f32 = data[off + i]
+            let im: f32 = data[off + i + 1]
+            let c: f32 = freqs[i]
+            let s: f32 = freqs[i + 1]
+            out[off + i] = r * c - im * s
+            out[off + i + 1] = r * s + im * c
+            i = i + 2
+        }
+
+        h = h + 1
+    }
+}

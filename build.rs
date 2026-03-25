@@ -25,6 +25,7 @@ fn main() {
         ("q4k_quant", "libq4k_quant.so"),
         ("q4k_dot", "libq4k_dot.so"),
         ("q6k_dot", "libq6k_dot.so"),
+        ("rope", "librope.so"),
     ];
 
     let out_dir = std::env::var("OUT_DIR").unwrap();

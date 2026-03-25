@@ -38,16 +38,11 @@ pub(crate) fn build_rope_freqs(freqs: &mut [f32], head_dim: usize, pos: usize, t
 }
 
 pub(crate) fn apply_rope(data: &mut [f32], freqs: &[f32], head_dim: usize, n_heads: usize) {
-    for h in 0..n_heads {
-        let off = h * head_dim;
-        for i in 0..head_dim / 2 {
-            let cos = freqs[2 * i];
-            let sin = freqs[2 * i + 1];
-            let r = data[off + 2 * i];
-            let im = data[off + 2 * i + 1];
-            data[off + 2 * i] = r * cos - im * sin;
-            data[off + 2 * i + 1] = r * sin + im * cos;
-        }
+    unsafe {
+        ffi::apply_rope_f32(
+            data.as_ptr(), freqs.as_ptr(), data.as_mut_ptr(),
+            head_dim as i32, n_heads as i32,
+        );
     }
 }
 

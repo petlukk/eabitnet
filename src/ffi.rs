@@ -149,6 +149,12 @@ pub unsafe fn q6k_dot_q8k(
     (embed::k().q6k_dot_q8k)(ql, qh, scales, q8, bsums, n_blocks, d)
 }
 
+pub unsafe fn apply_rope_f32(
+    data: *const f32, freqs: *const f32, out: *mut f32, head_dim: i32, n_heads: i32,
+) {
+    (embed::k().apply_rope_f32)(data, freqs, out, head_dim, n_heads)
+}
+
 pub unsafe fn q6k_dot_q8k_4row(
     ql0: *const u8, ql1: *const u8, ql2: *const u8, ql3: *const u8,
     qh0: *const u8, qh1: *const u8, qh2: *const u8, qh3: *const u8,

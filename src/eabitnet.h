@@ -36,8 +36,11 @@ void rmsnorm_f32(const float *x, const float *weight, float *out, int32_t n, flo
 // Softmax: numerically stable, fast exp polynomial
 void softmax_f32(const float *x, float *out, int32_t n);
 
-// RoPE: in-place rotation of Q and K by precomputed (cos,sin) frequency pairs
-void rope_f32(float *q, float *k, const float *freqs, int32_t head_dim, int32_t n_heads);
+// RoPE: apply precomputed cos/sin rotation to Q or K vector
+// freqs layout: [cos_0, sin_0, cos_1, sin_1, ...] (head_dim values)
+// data layout:  [head0: r0, im0, r1, im1, ...][head1: ...] (n_heads * head_dim)
+void apply_rope_f32(const float *data, const float *freqs, float *out,
+                    int32_t head_dim, int32_t n_heads);
 
 // Attention: scaled dot products Q·K for all cached tokens
 void attn_scores_f32(const float *q, const float *k_cache, float *out,
