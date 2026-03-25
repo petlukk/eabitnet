@@ -9,6 +9,7 @@ mod matmul_q6k;
 mod gemm_q4k;
 mod gemm_q6k;
 mod gemm_i2s;
+mod prefill;
 mod model;
 mod repl;
 mod server;
