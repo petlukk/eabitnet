@@ -11,7 +11,7 @@
 Llama.cpp is a beast, but even beasts have predators.
 
 A ~7K-line LLM inference engine written in Rust + [Ea](https://github.com/petlukk/eacompute) SIMD kernels.
-Faster than BitNet.cpp. Matches llama.cpp on decode. ~7K LOC vs ~250K.
+Faster than BitNet.cpp on decode. GEMM-batched prefill. ~7K LOC vs ~250K.
 
 Zero runtime dependencies. No CUDA. No BLAS. No frameworks.
 Single self-contained binary (kernels embedded). Built for speed.
@@ -20,15 +20,16 @@ Single self-contained binary (kernels embedded). Built for speed.
 
 **Supported models:** BitNet b1.58 (I2_S) and Llama-family Q4_K_M — any GGUF file
 
-### Decode performance
+### Performance highlights
 
-- **BitNet: 19.3 tok/s** (+31% vs BitNet.cpp)
-- **Llama 3B: 8.3 tok/s** (~1% from llama.cpp)
+- **BitNet decode: 18.0 tok/s** (+22% vs BitNet.cpp)
+- **BitNet prefill: 47.5 tok/s** (GEMM-batched, 2.4x over sequential)
+- **Llama 3B decode: 8.3 tok/s** (~1% from llama.cpp)
 - **BitNet on Raspberry Pi 5: 16.1 tok/s** (4 ARM cores, stock cooler)
 
 ## Why Cougar?
 
-- Faster than BitNet.cpp (+31% decode)
+- Faster than BitNet.cpp (+22% decode)
 - Matches llama.cpp on decode performance
 - ~7K LOC vs ~250K LOC in llama.cpp
 - Zero dependencies, single binary
@@ -39,22 +40,22 @@ Single self-contained binary (kernels embedded). Built for speed.
 
 ### x86-64 (16 threads, AVX2, native Linux)
 
-#### BitNet b1.58 2B-4T
+#### BitNet b1.58 2B-4T (256 tokens, 22-token prompt)
 
 | | Cougar | BitNet.cpp |
 |---|---|---|
-| Decode | **19.3 tok/s** | 14.8 tok/s |
-| | **+31% faster** | |
+| Prefill | **47.5 tok/s** | 81.2 tok/s |
+| Decode | **18.0 tok/s** | 14.7 tok/s |
+| | **+22% faster decode** | |
 
-#### Llama 3.2 3B Instruct Q4_K_M
+Prefill uses GEMM-style batching (load weights once, multiply all tokens). BitNet.cpp uses LUT-based matmul which is faster for prefill but slower for decode.
+
+#### Llama 3.2 3B Instruct Q4_K_M (256 tokens, 22-token prompt)
 
 | | Cougar | llama.cpp |
 |---|---|---|
-| Decode | **8.3 tok/s** | 8.4 tok/s |
-| Prefill (6 tok) | 14.0 tok/s | 27.8 tok/s |
-| Prefill (21 tok) | 17.7 tok/s | 32.7 tok/s |
-
-Decode within 1% of llama.cpp. Prefill is slower due to lack of full GEMM batching (decode is already optimized).
+| Prefill | 19.5 tok/s | 34.5 tok/s |
+| Decode | **7.8 tok/s** | 9.3 tok/s |
 
 ### ARM aarch64 (Raspberry Pi 5, 4 cores, NEON+dotprod)
 
@@ -142,8 +143,8 @@ Options:
 
 ```
 cougar/
-  kernels/     20 Ea SIMD kernels (10 x86 AVX2 + 10 ARM NEON)
-  src/         17 Rust modules (79 tests)
+  kernels/     21 Ea SIMD kernels (11 x86 AVX2 + 10 ARM NEON)
+  src/         23 Rust modules (82 tests)
   tests/       3 C kernel test harnesses (29 tests)
   build.rs     kernel embedding + ABI hash
 ```
@@ -152,7 +153,7 @@ cougar/
 
 Two forward paths dispatch based on GGUF weight type:
 
-**BitNet (I2_S):** RMSNorm -> i8 quantize -> ternary matmul (i2 x i8 via maddubs) -> squared ReLU -> i8 output projection. Fused gate+up dual kernel shares activation loads.
+**BitNet (I2_S):** RMSNorm -> i8 quantize -> ternary matmul (i2 x i8 via maddubs) -> squared ReLU -> i8 output projection. Fused gate+up dual kernel shares activation loads. GEMM-style batched prefill loads weights once per layer.
 
 **Llama Q4_K_M (mixed Q4_K + Q6_K):** RMSNorm -> Q8_K quantize -> Q4_K/Q6_K matmul (nibble x i8 via maddubs, 6-bit scale unpacking) -> SiLU (fused inline) -> GEMM-style batched prefill with L1 weight reuse.
 
@@ -170,7 +171,7 @@ Both paths use a persistent condvar-based thread pool with QKV `run_split3` conc
 - **Speculative output projection** (ARM) -- stride-4 sketch pre-filters 128K vocab to top-512 candidates, 8x bandwidth reduction
 
 <details>
-<summary>Kernel table (20 kernels)</summary>
+<summary>Kernel table (21 kernels)</summary>
 
 | Kernel | Lines | What |
 |--------|------:|------|
@@ -192,6 +193,7 @@ Both paths use a persistent condvar-based thread pool with QKV `run_split3` conc
 | `bitnet_rmsnorm_arm.ea` | 52 | RMS normalization (ARM NEON) |
 | `bitnet_activate.ea` | 32 | Squared ReLU x up (fused) |
 | `bitnet_activate_arm.ea` | 31 | Squared ReLU x up (ARM NEON) |
+| `rope.ea` | 70 | Rotary position embedding (shuffle+fma) |
 | `bitnet_vecadd.ea` | 17 | Residual vector add |
 | `bitnet_vecadd_arm.ea` | 17 | Residual vector add (ARM NEON) |
 
@@ -199,11 +201,11 @@ Both paths use a persistent condvar-based thread pool with QKV `run_split3` conc
 
 ## Tests
 
-108 tests total, zero warnings:
+111 tests total, zero warnings:
 
 | Suite | Tests |
 |---|---|
-| Rust (`cargo test`) | 79 |
+| Rust (`cargo test`) | 82 |
 | C kernel (Q6K dot) | 15 |
 | C kernel (Q4K dot) | 7 |
 | C kernel (Q8K quant) | 7 |
