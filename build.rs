@@ -4,8 +4,14 @@ use std::hash::{Hash, Hasher};
 use std::path::Path;
 
 fn main() {
-    let lib_dir = Path::new("build/lib");
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let lib_dir = if target.starts_with("aarch64") {
+        Path::new("build/lib-arm")
+    } else {
+        Path::new("build/lib")
+    };
     println!("cargo:rerun-if-changed=build/lib");
+    println!("cargo:rerun-if-changed=build/lib-arm");
     println!("cargo:rustc-link-lib=dl");
 
     let kernels = [

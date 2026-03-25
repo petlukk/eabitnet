@@ -26,6 +26,10 @@ pub struct BitNetModel {
     pub embed_weight_f16: *const u8,
     pub embed_weight_i8: Vec<u8>,       // per-row quantized (u8 = i8 + 128 bias)
     pub embed_row_scales: Vec<f32>,     // per-row absmax scale
+    #[cfg(target_arch = "aarch64")]
+    pub embed_sketch: Vec<u8>,          // subsampled (every 4th byte) for speculative top-k
+    #[cfg(target_arch = "aarch64")]
+    pub embed_sketch_dim: usize,        // hidden_dim / SKETCH_STRIDE
     pub norm_weight: *const f32,
     /// Owned repacked I2_S weight data (keeps pointers valid)
     pub(crate) _weight_data: Vec<Vec<u8>>,
@@ -267,6 +271,10 @@ impl BitNetModel {
                 embed_weight_f16: embed_weight_ptr,
                 embed_weight_i8: Vec::new(),
                 embed_row_scales: Vec::new(),
+                #[cfg(target_arch = "aarch64")]
+                embed_sketch: Vec::new(),
+                #[cfg(target_arch = "aarch64")]
+                embed_sketch_dim: 0,
                 norm_weight: tensor_ptr::<f32>(gguf, "output_norm.weight")?,
                 _weight_data: Vec::new(),
                 q4k_layers,
@@ -315,15 +323,40 @@ impl BitNetModel {
             }
             embed_row_scales.push(amax);
             if amax < 1e-10 {
+                #[cfg(target_arch = "aarch64")]
+                for _ in 0..hidden_dim { embed_weight_i8.push(0u8); } // zero (no bias on ARM)
+                #[cfg(not(target_arch = "aarch64"))]
                 for _ in 0..hidden_dim { embed_weight_i8.push(128u8); } // zero → 128 (bias)
             } else {
                 let inv = 127.0 / amax;
                 for d in 0..hidden_dim {
                     let q = (f16_to_f32(embed_f16[base + d]) * inv).round().clamp(-127.0, 127.0) as i8;
+                    #[cfg(target_arch = "aarch64")]
+                    embed_weight_i8.push(q as u8); // store raw i8 (no bias on ARM)
+                    #[cfg(not(target_arch = "aarch64"))]
                     embed_weight_i8.push((q as i16 + 128) as u8);
                 }
             }
         }
+        // Build sketch table for speculative top-k (ARM only)
+        #[cfg(target_arch = "aarch64")]
+        let (embed_sketch, sketch_dim) = {
+            const SKETCH_STRIDE: usize = 4;
+            let sd = hidden_dim / SKETCH_STRIDE;
+            let mut sketch = Vec::with_capacity(vocab_size * sd);
+            for row in 0..vocab_size {
+                let base = row * hidden_dim;
+                for s in 0..sd {
+                    sketch.push(embed_weight_i8[base + s * SKETCH_STRIDE]);
+                }
+            }
+            eprintln!("  Embedding: {} vocab × {} dim, i8 ({:.0} MB), sketch {}d ({:.1} MB)",
+                vocab_size, hidden_dim,
+                embed_weight_i8.len() as f64 / 1e6,
+                sd, sketch.len() as f64 / 1e6);
+            (sketch, sd)
+        };
+        #[cfg(not(target_arch = "aarch64"))]
         eprintln!("  Embedding: {} vocab × {} dim, i8 ({:.0} MB)",
             vocab_size, hidden_dim,
             embed_weight_i8.len() as f64 / 1e6);
@@ -367,6 +400,10 @@ impl BitNetModel {
             embed_weight_f16,
             embed_weight_i8,
             embed_row_scales,
+            #[cfg(target_arch = "aarch64")]
+            embed_sketch,
+            #[cfg(target_arch = "aarch64")]
+            embed_sketch_dim: sketch_dim,
             norm_weight,
             _weight_data: weight_data,
             q4k_layers: Vec::new(),

@@ -1,0 +1,78 @@
+// bitnet_quant_arm.ea — ARM NEON quantization kernels for BitNet inference
+//
+// ARM NEON port of bitnet_quant.ea. Uses f32x4 (128-bit NEON) instead of
+// f32x8 (256-bit AVX2). narrow_f32x4_i8 is cross-platform and works on ARM.
+//
+// pack_ternary_row is scalar-only and lives in bitnet_quant.ea (shared).
+
+#[cfg(aarch64)]
+
+// Per-tensor activation quantization: f32 → int8
+// Pass 1: SIMD absmax over f32x4
+// Pass 2: scale by 127/absmax, narrow f32x4 → i8, store as i8x16
+export func quant_f32_i8(
+    src: *restrict f32,
+    out dst: *mut i8 [cap: n + 12],
+    out out_scale: *mut f32 [cap: 1],
+    out out_sum: *mut i32 [cap: 1],
+    n: i32
+) {
+    // Pass 1: find absmax using f32x4 SIMD
+    let mut vmax: f32x4 = splat(0.0)
+    let vzero: f32x4 = splat(0.0)
+    let mut i: i32 = 0
+    while i + 4 <= n {
+        let v: f32x4 = load(src, i)
+        let neg: f32x4 = vzero .- v
+        let abs_v: f32x4 = select(v .> neg, v, neg)
+        vmax = select(abs_v .> vmax, abs_v, vmax)
+        i = i + 4
+    }
+    let mut amax: f32 = reduce_max(vmax)
+    while i < n {
+        let mut av: f32 = src[i]
+        if av < 0.0 {
+            av = 0.0 - av
+        }
+        if av > amax {
+            amax = av
+        }
+        i = i + 1
+    }
+
+    out_scale[0] = amax
+
+    if amax < 0.000001 {
+        let z16: i8x16 = splat(0)
+        i = 0
+        while i + 16 <= n {
+            store(dst, i, z16)
+            i = i + 16
+        }
+        while i < n {
+            dst[i] = 0
+            i = i + 1
+        }
+        out_sum[0] = 0
+        return
+    }
+
+    // Pass 2: scale and narrow to i8 via narrow_f32x4_i8
+    let inv_scale: f32 = 127.0 / amax
+    let v_inv: f32x4 = splat(inv_scale)
+    let v_min: f32x4 = splat(-127.0)
+    let v_max: f32x4 = splat(127.0)
+
+    let mut total_sum: i32 = 0
+    i = 0
+    while i + 4 <= n {
+        let v: f32x4 = load(src, i)
+        let scaled: f32x4 = v .* v_inv
+        let clamped: f32x4 = select(scaled .< v_min, v_min, select(scaled .> v_max, v_max, scaled))
+        let narrow: i8x16 = narrow_f32x4_i8(clamped)
+        store(dst, i, narrow)
+        total_sum = total_sum + to_i32(dst[i]) + to_i32(dst[i + 1]) + to_i32(dst[i + 2]) + to_i32(dst[i + 3])
+        i = i + 4
+    }
+    out_sum[0] = total_sum
+}

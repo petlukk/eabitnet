@@ -14,18 +14,20 @@ A ~7,100-line LLM inference engine written in Rust + [Ea](https://github.com/pet
 
 **Supported models:** BitNet b1.58 (I2_S) and Llama-family Q4_K_M (Llama 3, Mistral, Qwen)
 
+📦 **1004 KB** binary (x86-64) · **1.6 MB** binary (ARM aarch64) · All kernels embedded, zero runtime dependencies
+
 ## Performance
 
-16 threads, x86-64 AVX2, native Linux:
+### x86-64 (16 threads, AVX2, native Linux)
 
-### BitNet b1.58 2B-4T
+#### BitNet b1.58 2B-4T
 
 | | Cougar | BitNet.cpp |
 |---|---|---|
 | Decode | **19.3 tok/s** | 14.8 tok/s |
 | | **+31% faster** | |
 
-### Llama 3.2 3B Instruct Q4_K_M
+#### Llama 3.2 3B Instruct Q4_K_M
 
 | | Cougar | llama.cpp |
 |---|---|---|
@@ -34,6 +36,21 @@ A ~7,100-line LLM inference engine written in Rust + [Ea](https://github.com/pet
 | Prefill (21 tok) | 17.7 tok/s | 32.7 tok/s |
 
 Decode within 1% of llama.cpp. Prefill gap is true kernel-level GEMM batching (planned).
+
+### ARM aarch64 (Raspberry Pi 5, 4 cores, NEON+dotprod)
+
+#### BitNet b1.58 2B-4T
+
+| Metric | Value |
+|--------|-------|
+| Decode | **16.1 tok/s** |
+| Prefill | 16.3 tok/s |
+| Latency | 62 ms/tok |
+| Memory | ~2.0 GB |
+
+> **Note:** Measured at 1.6 GHz (thermal throttling with stock cooler). Pi 5 max is 2.4 GHz — with active cooling, expect ~24 tok/s.
+
+Speculative output projection (stride-4 sketch, top-512) reduces the 128K-vocab embedding scan from 328 MB to ~82 MB per token. Full ARM NEON kernel set — no x86 emulation, no fallbacks.
 
 ## Quick start
 
@@ -86,8 +103,8 @@ cougar --prompt "Hello"
 
 ```
 cougar/
-  kernels/     10 Ea SIMD kernels (.ea -> .so, embedded in binary)
-  src/         16 Rust modules (76 tests)
+  kernels/     20 Ea SIMD kernels (10 x86 AVX2 + 10 ARM NEON)
+  src/         17 Rust modules (79 tests)
   tests/       3 C kernel test harnesses (29 tests)
   build.rs     kernel embedding + ABI hash
 ```
@@ -106,14 +123,23 @@ Both paths use a persistent condvar-based thread pool with QKV `run_split3` conc
 
 ### Kernels
 
-10 Ea kernels, 1,587 lines:
+20 Ea kernels (10 x86 + 10 ARM NEON):
 
 | Kernel | Lines | What |
 |--------|------:|------|
 | `q4k_dot.ea` | 342 | Q4_K dot product: 1-row, 4-row, 4-row dual |
 | `q6k_dot.ea` | 256 | Q6_K dot product: 1-row, 4-row |
 | `bitnet_i2s.ea` | 242 | Ternary matmul: 1-row, 4-row, 4-row dual (x86) |
-| `bitnet_i2s_arm.ea` | 145 | Ternary matmul (ARM NEON) |
+| `bitnet_i2s_arm.ea` | 248 | Ternary matmul: 1-row, 4-row, 4-row dual (ARM NEON) |
+| `q4k_dot_arm.ea` | 329 | Q4_K dot product: 1-row, 4-row, 4-row dual (ARM NEON) |
+| `q6k_dot_arm.ea` | 243 | Q6_K dot product: 1-row, 4-row (ARM NEON) |
+| `bitnet_i8dot_arm.ea` | 102 | i8 x i8 dot for quantized output (ARM NEON) |
+| `bitnet_fused_attn_arm.ea` | 103 | Single-pass online softmax attention (ARM NEON) |
+| `bitnet_quant_arm.ea` | 78 | f32 -> i8 quantization (ARM NEON) |
+| `q4k_quant_arm.ea` | 84 | f32 -> Q8_K quantization (ARM NEON) |
+| `bitnet_rmsnorm_arm.ea` | 52 | RMS normalization (ARM NEON) |
+| `bitnet_activate_arm.ea` | 31 | Squared ReLU x up (ARM NEON) |
+| `bitnet_vecadd_arm.ea` | 17 | Residual vector add (ARM NEON) |
 | `bitnet_fused_attn.ea` | 120 | Single-pass online softmax attention |
 | `bitnet_i8dot.ea` | 106 | i8 x u8 dot for quantized output |
 | `bitnet_quant.ea` | 105 | f32 -> i8 quantization + activation sum |
@@ -131,14 +157,15 @@ Both paths use a persistent condvar-based thread pool with QKV `run_split3` conc
 - **GEMM-style prefill** -- weight rows loaded once, reused across all prompt tokens
 - **Q6_K mixed dispatch** -- per-tensor Q4_K/Q6_K detection for Q4_K_M models
 - **Tied embedding fallback** -- handles models without separate output.weight
+- **Speculative output projection** (ARM) -- stride-4 sketch pre-filters 128K vocab to top-512 candidates, then full precision on candidates only. 8x bandwidth reduction
 
 ## Tests
 
-105 tests total, zero warnings:
+108 tests total, zero warnings:
 
 | Suite | Tests |
 |---|---|
-| Rust (`cargo test`) | 76 |
+| Rust (`cargo test`) | 79 |
 | C kernel (Q6K dot) | 15 |
 | C kernel (Q4K dot) | 7 |
 | C kernel (Q8K quant) | 7 |
@@ -179,6 +206,38 @@ cd ~/projects/cougar
 make kernels                    # compile .ea -> .so
 cargo build --release           # kernels embedded in binary
 cargo test                      # 76 Rust tests
+```
+
+### Cross-compile for ARM (Raspberry Pi 5)
+
+```bash
+# Install cross toolchain (Ubuntu/Debian)
+sudo apt install gcc-aarch64-linux-gnu
+rustup target add aarch64-unknown-linux-gnu
+
+# Build ARM kernels
+EA=/path/to/ea
+for f in kernels/*_arm.ea; do
+  stem=$(basename "$f" _arm.ea)
+  CC=aarch64-linux-gnu-gcc $EA "$f" --lib \
+    --target-triple=aarch64-unknown-linux-gnu --dotprod \
+    -o build/lib-arm/lib${stem}.so
+done
+# Generic kernels (activate, rmsnorm, vecadd, quant, fused_attn)
+for f in kernels/bitnet_{activate,rmsnorm,vecadd,quant,fused_attn}_arm.ea \
+         kernels/q4k_quant_arm.ea; do
+  stem=$(basename "$f" _arm.ea)
+  CC=aarch64-linux-gnu-gcc $EA "$f" --lib \
+    --target-triple=aarch64-unknown-linux-gnu \
+    -o build/lib-arm/lib${stem}.so
+done
+
+# Build binary
+cargo build --release --target aarch64-unknown-linux-gnu
+
+# Copy to Pi and run
+scp target/aarch64-unknown-linux-gnu/release/cougar pi@raspberrypi:/tmp/
+ssh pi@raspberrypi '/tmp/cougar --prompt "Hello world" --max-tokens 20'
 ```
 
 Ea kernels are compiled to `.so`, embedded via `include_bytes!` at build time, extracted to `~/.cougar/lib/` on first run, and loaded via `dlopen`. No `LD_LIBRARY_PATH` needed.

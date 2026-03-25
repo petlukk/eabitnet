@@ -1,0 +1,102 @@
+// bitnet_i8dot_arm.ea — ARM NEON i8 dot product for quantized output projection
+//
+// ARM NEON port of bitnet_i8dot.ea. Same algorithm, different intrinsic:
+// vdot_i32(i8x16, i8x16) -> i32x4 maps to ARM vdotq_s32 (ARMv8.2-A+).
+//
+// Weights are pre-converted to unbiased i8 at model load time (no +128 bias).
+// This eliminates the per-element XOR that was needed when weights were u8.
+// vdot_i32 computes the true dot product directly — no correction needed.
+
+#[cfg(aarch64)]
+
+// 4-row dot product with 2x unrolling: processes 32 bytes per iteration.
+export func i8dot_4row(
+    act: *restrict i8,
+    w0: *restrict i8,
+    w1: *restrict i8,
+    w2: *restrict i8,
+    w3: *restrict i8,
+    out scores: *mut i32 [cap: 4],
+    n: i32
+) {
+    let mut r0: i32x4 = splat(0)
+    let mut r1: i32x4 = splat(0)
+    let mut r2: i32x4 = splat(0)
+    let mut r3: i32x4 = splat(0)
+
+    // 2x unrolled: process 32 bytes per iteration
+    let mut i: i32 = 0
+    while i + 32 <= n {
+        // First 16 bytes
+        let a0: i8x16 = load(act, i)
+        let w00: i8x16 = load(w0, i)
+        let w10: i8x16 = load(w1, i)
+        let w20: i8x16 = load(w2, i)
+        let w30: i8x16 = load(w3, i)
+        r0 = r0 .+ vdot_i32(w00, a0)
+        r1 = r1 .+ vdot_i32(w10, a0)
+        r2 = r2 .+ vdot_i32(w20, a0)
+        r3 = r3 .+ vdot_i32(w30, a0)
+
+        // Second 16 bytes — independent from first batch
+        let a1: i8x16 = load(act, i + 16)
+        let w01: i8x16 = load(w0, i + 16)
+        let w11: i8x16 = load(w1, i + 16)
+        let w21: i8x16 = load(w2, i + 16)
+        let w31: i8x16 = load(w3, i + 16)
+        r0 = r0 .+ vdot_i32(w01, a1)
+        r1 = r1 .+ vdot_i32(w11, a1)
+        r2 = r2 .+ vdot_i32(w21, a1)
+        r3 = r3 .+ vdot_i32(w31, a1)
+
+        i = i + 32
+    }
+
+    // Tail: remaining 16-byte block
+    while i + 16 <= n {
+        let a: i8x16 = load(act, i)
+        let wt0: i8x16 = load(w0, i)
+        let wt1: i8x16 = load(w1, i)
+        let wt2: i8x16 = load(w2, i)
+        let wt3: i8x16 = load(w3, i)
+        r0 = r0 .+ vdot_i32(wt0, a)
+        r1 = r1 .+ vdot_i32(wt1, a)
+        r2 = r2 .+ vdot_i32(wt2, a)
+        r3 = r3 .+ vdot_i32(wt3, a)
+        i = i + 16
+    }
+
+    scores[0] = reduce_add(r0)
+    scores[1] = reduce_add(r1)
+    scores[2] = reduce_add(r2)
+    scores[3] = reduce_add(r3)
+}
+
+// Single-row dot product with dual accumulators.
+export func i8dot_1row(
+    act: *restrict i8,
+    w: *restrict i8,
+    n: i32
+) -> i32 {
+    let mut acc_a: i32x4 = splat(0)
+    let mut acc_b: i32x4 = splat(0)
+
+    let mut i: i32 = 0
+    while i + 32 <= n {
+        let wa: i8x16 = load(w, i)
+        let aa: i8x16 = load(act, i)
+        let wb: i8x16 = load(w, i + 16)
+        let ab: i8x16 = load(act, i + 16)
+        acc_a = acc_a .+ vdot_i32(wa, aa)
+        acc_b = acc_b .+ vdot_i32(wb, ab)
+        i = i + 32
+    }
+    while i + 16 <= n {
+        let wt: i8x16 = load(w, i)
+        let at: i8x16 = load(act, i)
+        acc_a = acc_a .+ vdot_i32(wt, at)
+        i = i + 16
+    }
+
+    return reduce_add(acc_a .+ acc_b)
+}

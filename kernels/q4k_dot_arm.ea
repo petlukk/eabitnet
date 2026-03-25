@@ -1,0 +1,329 @@
+// q4k_dot_arm.ea — ARM NEON Q4_K × Q8_K dot product kernel
+//
+// ARM NEON port of q4k_dot.ea. Same algorithm, different intrinsic:
+// vdot_i32(i8x16, i8x16) -> i32x4 maps to ARM vdotq_s32 (ARMv8.2-A+).
+//
+// Q4_K nibbles are 0-15, which fit in signed i8 — no bias correction needed.
+// Unlike x86 (logical shift on u8), ARM arithmetic shift on i8 requires
+// masking after high nibble extraction: (q4v >> 4) & 0x0F.
+//
+// Q4 weight pointer is *i8 (bit-identical to u8 data, reinterpreted for vdot).
+
+#[cfg(aarch64)]
+
+// Single-row Q4_K × Q8_K dot product.
+export func q4k_dot_q8k(
+    q4: *restrict i8,
+    q8: *restrict i8,
+    bsums: *restrict i32,
+    scales: *restrict u8,
+    mins: *restrict u8,
+    n_blocks: i32,
+    d: f32,
+    dmin: f32
+) -> f32 {
+    let mask_lo: i8x16 = splat(15)
+    let shift4: i8x16 = splat(4)
+    let mut result: f32 = 0.0
+
+    let mut blk: i32 = 0
+    while blk < n_blocks {
+        let q4_off: i32 = blk * 128
+        let q8_off: i32 = blk * 256
+        let sc_off: i32 = blk * 8
+        let bs_off: i32 = blk * 16
+
+        let mut sumi: i32 = 0
+
+        let mut j: i32 = 0
+        while j < 4 {
+            // Low nibbles: q4[j*32..j*32+31] & 0x0F × q8[j*64..j*64+31]
+            let mut acc_lo: i32x4 = splat(0)
+            let mut half: i32 = 0
+            while half < 2 {
+                let q4v: i8x16 = load(q4, q4_off + j * 32 + half * 16)
+                let q4_lo: i8x16 = q4v .& mask_lo
+                let q8v: i8x16 = load(q8, q8_off + j * 64 + half * 16)
+                acc_lo = acc_lo .+ vdot_i32(q4_lo, q8v)
+                half = half + 1
+            }
+            let sc_lo: i32 = to_i32(scales[sc_off + 2 * j])
+            sumi = sumi + reduce_add(acc_lo) * sc_lo
+
+            // High nibbles: (q4 >> 4) & 0x0F × q8[j*64+32..j*64+63]
+            let mut acc_hi: i32x4 = splat(0)
+            half = 0
+            while half < 2 {
+                let q4v2: i8x16 = load(q4, q4_off + j * 32 + half * 16)
+                let q4_hi: i8x16 = (q4v2 .>> shift4) .& mask_lo
+                let q8v2: i8x16 = load(q8, q8_off + j * 64 + 32 + half * 16)
+                acc_hi = acc_hi .+ vdot_i32(q4_hi, q8v2)
+                half = half + 1
+            }
+            let sc_hi: i32 = to_i32(scales[sc_off + 2 * j + 1])
+            sumi = sumi + reduce_add(acc_hi) * sc_hi
+
+            j = j + 1
+        }
+
+        let mut summs: i32 = 0
+        j = 0
+        while j < 8 {
+            let m: i32 = to_i32(mins[sc_off + j])
+            let bs_pair: i32 = bsums[bs_off + 2 * j] + bsums[bs_off + 2 * j + 1]
+            summs = summs + m * bs_pair
+            j = j + 1
+        }
+
+        result = result + d * to_f32(sumi) - dmin * to_f32(summs)
+
+        blk = blk + 1
+    }
+
+    return result
+}
+
+// 4-row Q4_K × Q8_K dot product: 4 weight rows × shared activations.
+export func q4k_dot_q8k_4row(
+    rw0: *restrict i8, rw1: *restrict i8, rw2: *restrict i8, rw3: *restrict i8,
+    q8: *restrict i8,
+    bsums: *restrict i32,
+    sc0: *restrict u8, sc1: *restrict u8, sc2: *restrict u8, sc3: *restrict u8,
+    mn0: *restrict u8, mn1: *restrict u8, mn2: *restrict u8, mn3: *restrict u8,
+    out scores: *mut f32 [cap: 4],
+    n_blocks: i32,
+    d0: f32, d1: f32, d2: f32, d3: f32,
+    dm0: f32, dm1: f32, dm2: f32, dm3: f32
+) {
+    let mask_lo: i8x16 = splat(15)
+    let shift4: i8x16 = splat(4)
+    let mut res0: f32 = 0.0
+    let mut res1: f32 = 0.0
+    let mut res2: f32 = 0.0
+    let mut res3: f32 = 0.0
+
+    let mut blk: i32 = 0
+    while blk < n_blocks {
+        let q4_off: i32 = blk * 128
+        let q8_off: i32 = blk * 256
+        let sc_off: i32 = blk * 8
+        let bs_off: i32 = blk * 16
+
+        let mut sumi0: i32 = 0
+        let mut sumi1: i32 = 0
+        let mut sumi2: i32 = 0
+        let mut sumi3: i32 = 0
+
+        let mut j: i32 = 0
+        while j < 4 {
+            let q8_a0: i8x16 = load(q8, q8_off + j * 64)
+            let q8_a1: i8x16 = load(q8, q8_off + j * 64 + 16)
+            let q8_b0: i8x16 = load(q8, q8_off + j * 64 + 32)
+            let q8_b1: i8x16 = load(q8, q8_off + j * 64 + 48)
+
+            // Row 0
+            let p0a: i8x16 = load(rw0, q4_off + j * 32)
+            let p0b: i8x16 = load(rw0, q4_off + j * 32 + 16)
+            let d0_lo: i32 = reduce_add(vdot_i32(p0a .& mask_lo, q8_a0) .+ vdot_i32(p0b .& mask_lo, q8_a1))
+            let d0_hi: i32 = reduce_add(vdot_i32((p0a .>> shift4) .& mask_lo, q8_b0) .+ vdot_i32((p0b .>> shift4) .& mask_lo, q8_b1))
+            sumi0 = sumi0 + d0_lo * to_i32(sc0[sc_off + 2 * j]) + d0_hi * to_i32(sc0[sc_off + 2 * j + 1])
+
+            // Row 1
+            let p1a: i8x16 = load(rw1, q4_off + j * 32)
+            let p1b: i8x16 = load(rw1, q4_off + j * 32 + 16)
+            let d1_lo: i32 = reduce_add(vdot_i32(p1a .& mask_lo, q8_a0) .+ vdot_i32(p1b .& mask_lo, q8_a1))
+            let d1_hi: i32 = reduce_add(vdot_i32((p1a .>> shift4) .& mask_lo, q8_b0) .+ vdot_i32((p1b .>> shift4) .& mask_lo, q8_b1))
+            sumi1 = sumi1 + d1_lo * to_i32(sc1[sc_off + 2 * j]) + d1_hi * to_i32(sc1[sc_off + 2 * j + 1])
+
+            // Row 2
+            let p2a: i8x16 = load(rw2, q4_off + j * 32)
+            let p2b: i8x16 = load(rw2, q4_off + j * 32 + 16)
+            let d2_lo: i32 = reduce_add(vdot_i32(p2a .& mask_lo, q8_a0) .+ vdot_i32(p2b .& mask_lo, q8_a1))
+            let d2_hi: i32 = reduce_add(vdot_i32((p2a .>> shift4) .& mask_lo, q8_b0) .+ vdot_i32((p2b .>> shift4) .& mask_lo, q8_b1))
+            sumi2 = sumi2 + d2_lo * to_i32(sc2[sc_off + 2 * j]) + d2_hi * to_i32(sc2[sc_off + 2 * j + 1])
+
+            // Row 3
+            let p3a: i8x16 = load(rw3, q4_off + j * 32)
+            let p3b: i8x16 = load(rw3, q4_off + j * 32 + 16)
+            let d3_lo: i32 = reduce_add(vdot_i32(p3a .& mask_lo, q8_a0) .+ vdot_i32(p3b .& mask_lo, q8_a1))
+            let d3_hi: i32 = reduce_add(vdot_i32((p3a .>> shift4) .& mask_lo, q8_b0) .+ vdot_i32((p3b .>> shift4) .& mask_lo, q8_b1))
+            sumi3 = sumi3 + d3_lo * to_i32(sc3[sc_off + 2 * j]) + d3_hi * to_i32(sc3[sc_off + 2 * j + 1])
+
+            j = j + 1
+        }
+
+        let mut summs0: i32 = 0
+        let mut summs1: i32 = 0
+        let mut summs2: i32 = 0
+        let mut summs3: i32 = 0
+        j = 0
+        while j < 8 {
+            let bs_pair: i32 = bsums[bs_off + 2 * j] + bsums[bs_off + 2 * j + 1]
+            summs0 = summs0 + to_i32(mn0[sc_off + j]) * bs_pair
+            summs1 = summs1 + to_i32(mn1[sc_off + j]) * bs_pair
+            summs2 = summs2 + to_i32(mn2[sc_off + j]) * bs_pair
+            summs3 = summs3 + to_i32(mn3[sc_off + j]) * bs_pair
+            j = j + 1
+        }
+
+        res0 = res0 + d0 * to_f32(sumi0) - dm0 * to_f32(summs0)
+        res1 = res1 + d1 * to_f32(sumi1) - dm1 * to_f32(summs1)
+        res2 = res2 + d2 * to_f32(sumi2) - dm2 * to_f32(summs2)
+        res3 = res3 + d3 * to_f32(sumi3) - dm3 * to_f32(summs3)
+
+        blk = blk + 1
+    }
+
+    scores[0] = res0
+    scores[1] = res1
+    scores[2] = res2
+    scores[3] = res3
+}
+
+// Dual 4-row Q4_K × Q8_K: 4 gate rows + 4 up rows × shared activations.
+export func q4k_dot_q8k_4row_dual(
+    gw0: *restrict i8, gw1: *restrict i8, gw2: *restrict i8, gw3: *restrict i8,
+    uw0: *restrict i8, uw1: *restrict i8, uw2: *restrict i8, uw3: *restrict i8,
+    q8: *restrict i8,
+    bsums: *restrict i32,
+    gsc0: *restrict u8, gsc1: *restrict u8, gsc2: *restrict u8, gsc3: *restrict u8,
+    gmn0: *restrict u8, gmn1: *restrict u8, gmn2: *restrict u8, gmn3: *restrict u8,
+    usc0: *restrict u8, usc1: *restrict u8, usc2: *restrict u8, usc3: *restrict u8,
+    umn0: *restrict u8, umn1: *restrict u8, umn2: *restrict u8, umn3: *restrict u8,
+    out gate_scores: *mut f32 [cap: 4],
+    out up_scores: *mut f32 [cap: 4],
+    n_blocks: i32,
+    gd0: f32, gd1: f32, gd2: f32, gd3: f32,
+    gdm0: f32, gdm1: f32, gdm2: f32, gdm3: f32,
+    ud0: f32, ud1: f32, ud2: f32, ud3: f32,
+    udm0: f32, udm1: f32, udm2: f32, udm3: f32
+) {
+    let mask_lo: i8x16 = splat(15)
+    let shift4: i8x16 = splat(4)
+    let mut gr0: f32 = 0.0
+    let mut gr1: f32 = 0.0
+    let mut gr2: f32 = 0.0
+    let mut gr3: f32 = 0.0
+    let mut ur0: f32 = 0.0
+    let mut ur1: f32 = 0.0
+    let mut ur2: f32 = 0.0
+    let mut ur3: f32 = 0.0
+
+    let mut blk: i32 = 0
+    while blk < n_blocks {
+        let q4_off: i32 = blk * 128
+        let q8_off: i32 = blk * 256
+        let sc_off: i32 = blk * 8
+        let bs_off: i32 = blk * 16
+
+        let mut gs0: i32 = 0
+        let mut gs1: i32 = 0
+        let mut gs2: i32 = 0
+        let mut gs3: i32 = 0
+        let mut us0: i32 = 0
+        let mut us1: i32 = 0
+        let mut us2: i32 = 0
+        let mut us3: i32 = 0
+
+        let mut j: i32 = 0
+        while j < 4 {
+            let q8_a0: i8x16 = load(q8, q8_off + j * 64)
+            let q8_a1: i8x16 = load(q8, q8_off + j * 64 + 16)
+            let q8_b0: i8x16 = load(q8, q8_off + j * 64 + 32)
+            let q8_b1: i8x16 = load(q8, q8_off + j * 64 + 48)
+
+            // Gate row 0 / Up row 0 — ILP: 2 independent chains
+            let gp0a: i8x16 = load(gw0, q4_off + j * 32)
+            let gp0b: i8x16 = load(gw0, q4_off + j * 32 + 16)
+            let up0a: i8x16 = load(uw0, q4_off + j * 32)
+            let up0b: i8x16 = load(uw0, q4_off + j * 32 + 16)
+            let gv0_lo: i32 = reduce_add(vdot_i32(gp0a .& mask_lo, q8_a0) .+ vdot_i32(gp0b .& mask_lo, q8_a1))
+            let uv0_lo: i32 = reduce_add(vdot_i32(up0a .& mask_lo, q8_a0) .+ vdot_i32(up0b .& mask_lo, q8_a1))
+            let gv0_hi: i32 = reduce_add(vdot_i32((gp0a .>> shift4) .& mask_lo, q8_b0) .+ vdot_i32((gp0b .>> shift4) .& mask_lo, q8_b1))
+            let uv0_hi: i32 = reduce_add(vdot_i32((up0a .>> shift4) .& mask_lo, q8_b0) .+ vdot_i32((up0b .>> shift4) .& mask_lo, q8_b1))
+            gs0 = gs0 + gv0_lo * to_i32(gsc0[sc_off + 2*j]) + gv0_hi * to_i32(gsc0[sc_off + 2*j+1])
+            us0 = us0 + uv0_lo * to_i32(usc0[sc_off + 2*j]) + uv0_hi * to_i32(usc0[sc_off + 2*j+1])
+
+            // Gate row 1 / Up row 1
+            let gp1a: i8x16 = load(gw1, q4_off + j * 32)
+            let gp1b: i8x16 = load(gw1, q4_off + j * 32 + 16)
+            let up1a: i8x16 = load(uw1, q4_off + j * 32)
+            let up1b: i8x16 = load(uw1, q4_off + j * 32 + 16)
+            let gv1_lo: i32 = reduce_add(vdot_i32(gp1a .& mask_lo, q8_a0) .+ vdot_i32(gp1b .& mask_lo, q8_a1))
+            let uv1_lo: i32 = reduce_add(vdot_i32(up1a .& mask_lo, q8_a0) .+ vdot_i32(up1b .& mask_lo, q8_a1))
+            let gv1_hi: i32 = reduce_add(vdot_i32((gp1a .>> shift4) .& mask_lo, q8_b0) .+ vdot_i32((gp1b .>> shift4) .& mask_lo, q8_b1))
+            let uv1_hi: i32 = reduce_add(vdot_i32((up1a .>> shift4) .& mask_lo, q8_b0) .+ vdot_i32((up1b .>> shift4) .& mask_lo, q8_b1))
+            gs1 = gs1 + gv1_lo * to_i32(gsc1[sc_off + 2*j]) + gv1_hi * to_i32(gsc1[sc_off + 2*j+1])
+            us1 = us1 + uv1_lo * to_i32(usc1[sc_off + 2*j]) + uv1_hi * to_i32(usc1[sc_off + 2*j+1])
+
+            // Gate row 2 / Up row 2
+            let gp2a: i8x16 = load(gw2, q4_off + j * 32)
+            let gp2b: i8x16 = load(gw2, q4_off + j * 32 + 16)
+            let up2a: i8x16 = load(uw2, q4_off + j * 32)
+            let up2b: i8x16 = load(uw2, q4_off + j * 32 + 16)
+            let gv2_lo: i32 = reduce_add(vdot_i32(gp2a .& mask_lo, q8_a0) .+ vdot_i32(gp2b .& mask_lo, q8_a1))
+            let uv2_lo: i32 = reduce_add(vdot_i32(up2a .& mask_lo, q8_a0) .+ vdot_i32(up2b .& mask_lo, q8_a1))
+            let gv2_hi: i32 = reduce_add(vdot_i32((gp2a .>> shift4) .& mask_lo, q8_b0) .+ vdot_i32((gp2b .>> shift4) .& mask_lo, q8_b1))
+            let uv2_hi: i32 = reduce_add(vdot_i32((up2a .>> shift4) .& mask_lo, q8_b0) .+ vdot_i32((up2b .>> shift4) .& mask_lo, q8_b1))
+            gs2 = gs2 + gv2_lo * to_i32(gsc2[sc_off + 2*j]) + gv2_hi * to_i32(gsc2[sc_off + 2*j+1])
+            us2 = us2 + uv2_lo * to_i32(usc2[sc_off + 2*j]) + uv2_hi * to_i32(usc2[sc_off + 2*j+1])
+
+            // Gate row 3 / Up row 3
+            let gp3a: i8x16 = load(gw3, q4_off + j * 32)
+            let gp3b: i8x16 = load(gw3, q4_off + j * 32 + 16)
+            let up3a: i8x16 = load(uw3, q4_off + j * 32)
+            let up3b: i8x16 = load(uw3, q4_off + j * 32 + 16)
+            let gv3_lo: i32 = reduce_add(vdot_i32(gp3a .& mask_lo, q8_a0) .+ vdot_i32(gp3b .& mask_lo, q8_a1))
+            let uv3_lo: i32 = reduce_add(vdot_i32(up3a .& mask_lo, q8_a0) .+ vdot_i32(up3b .& mask_lo, q8_a1))
+            let gv3_hi: i32 = reduce_add(vdot_i32((gp3a .>> shift4) .& mask_lo, q8_b0) .+ vdot_i32((gp3b .>> shift4) .& mask_lo, q8_b1))
+            let uv3_hi: i32 = reduce_add(vdot_i32((up3a .>> shift4) .& mask_lo, q8_b0) .+ vdot_i32((up3b .>> shift4) .& mask_lo, q8_b1))
+            gs3 = gs3 + gv3_lo * to_i32(gsc3[sc_off + 2*j]) + gv3_hi * to_i32(gsc3[sc_off + 2*j+1])
+            us3 = us3 + uv3_lo * to_i32(usc3[sc_off + 2*j]) + uv3_hi * to_i32(usc3[sc_off + 2*j+1])
+
+            j = j + 1
+        }
+
+        // Min correction — shared bsums, separate mins
+        let mut gm0: i32 = 0
+        let mut gm1: i32 = 0
+        let mut gm2: i32 = 0
+        let mut gm3: i32 = 0
+        let mut um0: i32 = 0
+        let mut um1: i32 = 0
+        let mut um2: i32 = 0
+        let mut um3: i32 = 0
+        j = 0
+        while j < 8 {
+            let bs_pair: i32 = bsums[bs_off + 2 * j] + bsums[bs_off + 2 * j + 1]
+            gm0 = gm0 + to_i32(gmn0[sc_off + j]) * bs_pair
+            gm1 = gm1 + to_i32(gmn1[sc_off + j]) * bs_pair
+            gm2 = gm2 + to_i32(gmn2[sc_off + j]) * bs_pair
+            gm3 = gm3 + to_i32(gmn3[sc_off + j]) * bs_pair
+            um0 = um0 + to_i32(umn0[sc_off + j]) * bs_pair
+            um1 = um1 + to_i32(umn1[sc_off + j]) * bs_pair
+            um2 = um2 + to_i32(umn2[sc_off + j]) * bs_pair
+            um3 = um3 + to_i32(umn3[sc_off + j]) * bs_pair
+            j = j + 1
+        }
+
+        gr0 = gr0 + gd0 * to_f32(gs0) - gdm0 * to_f32(gm0)
+        gr1 = gr1 + gd1 * to_f32(gs1) - gdm1 * to_f32(gm1)
+        gr2 = gr2 + gd2 * to_f32(gs2) - gdm2 * to_f32(gm2)
+        gr3 = gr3 + gd3 * to_f32(gs3) - gdm3 * to_f32(gm3)
+        ur0 = ur0 + ud0 * to_f32(us0) - udm0 * to_f32(um0)
+        ur1 = ur1 + ud1 * to_f32(us1) - udm1 * to_f32(um1)
+        ur2 = ur2 + ud2 * to_f32(us2) - udm2 * to_f32(um2)
+        ur3 = ur3 + ud3 * to_f32(us3) - udm3 * to_f32(um3)
+
+        blk = blk + 1
+    }
+
+    gate_scores[0] = gr0
+    gate_scores[1] = gr1
+    gate_scores[2] = gr2
+    gate_scores[3] = gr3
+    up_scores[0] = ur0
+    up_scores[1] = ur1
+    up_scores[2] = ur2
+    up_scores[3] = ur3
+}

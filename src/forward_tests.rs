@@ -22,6 +22,10 @@ fn mock_model(hidden_dim: usize, n_layers: usize, n_heads: usize, vocab_size: us
         embed_weight_f16: std::ptr::null(),
         embed_weight_i8: Vec::new(),
         embed_row_scales: Vec::new(),
+        #[cfg(target_arch = "aarch64")]
+        embed_sketch: Vec::new(),
+        #[cfg(target_arch = "aarch64")]
+        embed_sketch_dim: 0,
         norm_weight: std::ptr::null(),
         _weight_data: Vec::new(),
         q4k_layers: Vec::new(),

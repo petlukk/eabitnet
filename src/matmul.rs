@@ -56,11 +56,13 @@ pub(crate) fn i8_output_matmul_mt(
     }
     let x_inv = if x_amax > 1e-10 { 127.0 / x_amax } else { 0.0 };
     let mut x_i8 = vec![0i8; hidden_dim];
+    #[cfg(not(target_arch = "aarch64"))]
     let mut x_sum: i32 = 0;
     for d in 0..hidden_dim {
         let q = (x[d] * x_inv).round().clamp(-127.0, 127.0) as i8;
         x_i8[d] = q;
-        x_sum += q as i32;
+        #[cfg(not(target_arch = "aarch64"))]
+        { x_sum += q as i32; }
     }
 
     let embed_ptr = embed_i8.as_ptr() as usize;
@@ -94,6 +96,10 @@ pub(crate) fn i8_output_matmul_mt(
             }
             for j in 0..4 {
                 let row_s = unsafe { *scales.add(row + j) };
+                // ARM i8dot returns true dot (XOR-unbiased); x86 returns biased
+                #[cfg(target_arch = "aarch64")]
+                let corrected = raw4[j];
+                #[cfg(not(target_arch = "aarch64"))]
                 let corrected = raw4[j] - 128 * x_sum;
                 out[r + j] = corrected as f32 * x_scale * (row_s / 127.0);
             }
@@ -103,11 +109,113 @@ pub(crate) fn i8_output_matmul_mt(
             let row = start + r;
             let raw_val = unsafe { ffi::i8dot_1row(act, embed.add(row * h), h as i32) };
             let row_s = unsafe { *scales.add(row) };
+            #[cfg(target_arch = "aarch64")]
+            let corrected = raw_val;
+            #[cfg(not(target_arch = "aarch64"))]
             let corrected = raw_val - 128 * x_sum;
             out[r] = corrected as f32 * x_scale * (row_s / 127.0);
             r += 1;
         }
     });
+}
+
+/// Speculative i8 output matmul: pre-filter with sketch, full precision on top-K.
+/// Sketch table contains every 8th byte per row for rough scoring.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn i8_output_matmul_speculative(
+    embed_i8: &[u8], row_scales: &[f32],
+    sketch: &[u8], sketch_dim: usize,
+    x: &[f32], out: &mut [f32],
+    vocab_size: usize, hidden_dim: usize,
+    pool: &ThreadPool,
+) {
+    const TOP_K: usize = 512;
+    const SKETCH_STRIDE: usize = 4;
+
+    // Quantize activations
+    let mut x_amax = 0.0f32;
+    for &v in x.iter().take(hidden_dim) {
+        let a = v.abs();
+        if a > x_amax { x_amax = a; }
+    }
+    let x_inv = if x_amax > 1e-10 { 127.0 / x_amax } else { 0.0 };
+    let mut x_i8 = vec![0i8; hidden_dim];
+    for d in 0..hidden_dim {
+        x_i8[d] = (x[d] * x_inv).round().clamp(-127.0, 127.0) as i8;
+    }
+    let x_scale = x_amax / 127.0;
+
+    // Build subsampled activation vector (every 8th element)
+    let mut act_sketch = vec![0i8; sketch_dim];
+    for s in 0..sketch_dim {
+        act_sketch[s] = x_i8[s * SKETCH_STRIDE];
+    }
+
+    // Phase 1: rough scores via sketch (parallel), scaled by row_scales
+    let mut rough_scores = vec![0.0f32; vocab_size];
+    let sketch_ptr = sketch.as_ptr() as usize;
+    let act_sk_ptr = act_sketch.as_ptr() as usize;
+    let rough_ptr = rough_scores.as_mut_ptr() as usize;
+    let scales_ptr = row_scales.as_ptr() as usize;
+    let sd = sketch_dim;
+    let xsc = x_scale;
+
+    pool.run(pool.thread_count(), |tid, n_threads| {
+        let chunk = ((vocab_size + n_threads - 1) / n_threads + 3) & !3;
+        let start = tid * chunk;
+        let end = (start + chunk).min(vocab_size);
+        if start >= end { return; }
+        let sk = sketch_ptr as *const u8;
+        let act = act_sk_ptr as *const i8;
+        let scores = rough_ptr as *mut f32;
+        let scales = scales_ptr as *const f32;
+        let mut raw4 = [0i32; 4];
+        let mut r = start;
+        while r + 4 <= end {
+            unsafe {
+                ffi::i8dot_4row(
+                    act,
+                    sk.add(r * sd) as *const u8,
+                    sk.add((r+1) * sd) as *const u8,
+                    sk.add((r+2) * sd) as *const u8,
+                    sk.add((r+3) * sd) as *const u8,
+                    raw4.as_mut_ptr(), sd as i32,
+                );
+                for j in 0..4 {
+                    let rs = *scales.add(r + j);
+                    *scores.add(r + j) = raw4[j] as f32 * xsc * (rs / 127.0);
+                }
+            }
+            r += 4;
+        }
+        while r < end {
+            let v = unsafe { ffi::i8dot_1row(act, sk.add(r * sd) as *const u8, sd as i32) };
+            let rs = unsafe { *scales.add(r) };
+            unsafe { *scores.add(r) = v as f32 * xsc * (rs / 127.0); }
+            r += 1;
+        }
+    });
+
+    // Phase 2: find top-K indices
+    let mut indices: Vec<u32> = (0..vocab_size as u32).collect();
+    indices.select_nth_unstable_by(TOP_K, |&a, &b| {
+        rough_scores[b as usize].partial_cmp(&rough_scores[a as usize]).unwrap()
+    });
+    let top_indices = &indices[..TOP_K];
+
+    // Phase 3: full precision on top-K only
+    // Initialize output to -inf so argmax picks from candidates
+    for v in out.iter_mut() { *v = f32::NEG_INFINITY; }
+
+    let act_ptr = x_i8.as_ptr();
+    let embed_ptr = embed_i8.as_ptr();
+    let h = hidden_dim;
+    for &idx in top_indices {
+        let row = idx as usize;
+        let raw = unsafe { ffi::i8dot_1row(act_ptr, embed_ptr.add(row * h) as *const u8, h as i32) };
+        let row_s = row_scales[row];
+        out[row] = raw as f32 * x_scale * (row_s / 127.0);
+    }
 }
 
 /// Ternary matmul with configurable thread count.
@@ -341,3 +449,7 @@ pub(crate) fn ternary_matmul_fused_pair(
 #[cfg(test)]
 #[path = "matmul_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "sketch_tests.rs"]
+mod sketch_tests;

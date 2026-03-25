@@ -1,0 +1,31 @@
+// bitnet_activate_arm.ea — ARM NEON squared ReLU fused with up-projection
+//
+// out[i] = max(0, gate[i])^2 * up[i]
+
+#[cfg(aarch64)]
+
+export func squared_relu_mul_f32(
+    gate: *restrict f32,
+    up: *restrict f32,
+    out: *mut f32,
+    n: i32
+) {
+    let zero: f32x4 = splat(0.0)
+    let mut i: i32 = 0
+    while i + 4 <= n {
+        let vg: f32x4 = load(gate, i)
+        let vu: f32x4 = load(up, i)
+        let clamped: f32x4 = select(vg .> zero, vg, zero)
+        store(out, i, clamped .* clamped .* vu)
+        i = i + 4
+    }
+    while i < n {
+        let g: f32 = gate[i]
+        if g > 0.0 {
+            out[i] = g * g * up[i]
+        } else {
+            out[i] = 0.0
+        }
+        i = i + 1
+    }
+}

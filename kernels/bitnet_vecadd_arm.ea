@@ -1,0 +1,17 @@
+// bitnet_vecadd_arm.ea — ARM NEON element-wise f32 vector addition
+
+#[cfg(aarch64)]
+
+export func vecadd_f32(a: *restrict f32, b: *restrict f32, out: *mut f32, n: i32) {
+    let mut i: i32 = 0
+    while i + 4 <= n {
+        let va: f32x4 = load(a, i)
+        let vb: f32x4 = load(b, i)
+        store(out, i, va .+ vb)
+        i = i + 4
+    }
+    while i < n {
+        out[i] = a[i] + b[i]
+        i = i + 1
+    }
+}

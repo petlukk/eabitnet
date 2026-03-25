@@ -1,0 +1,84 @@
+// q4k_quant_arm.ea — ARM NEON Q8_K activation quantization for Q4_K matmul
+//
+// ARM NEON port of q4k_quant.ea. Uses f32x4 (128-bit NEON) instead of
+// f32x8 (256-bit AVX2). narrow_f32x4_i8 is cross-platform and works on ARM.
+
+#[cfg(aarch64)]
+
+export func quant_f32_q8k(
+    src: *restrict f32,
+    out dst_qs: *mut i8 [cap: n + 12],
+    out dst_d: *mut f32 [cap: n / 256],
+    out dst_bsums: *mut i32 [cap: n / 256 * 16],
+    n: i32
+) {
+    let blocks: i32 = n / 256
+    let mut b: i32 = 0
+
+    while b < blocks {
+        let base: i32 = b * 256
+
+        // Pass 1: absmax over 256 elements using f32x4 SIMD
+        let mut vmax: f32x4 = splat(0.0)
+        let vzero: f32x4 = splat(0.0)
+        let mut i: i32 = 0
+        while i < 256 {
+            let v: f32x4 = load(src, base + i)
+            let neg: f32x4 = vzero .- v
+            let abs_v: f32x4 = select(v .> neg, v, neg)
+            vmax = select(abs_v .> vmax, abs_v, vmax)
+            i = i + 4
+        }
+        let amax: f32 = reduce_max(vmax)
+
+        if amax < 0.000001 {
+            dst_d[b] = 0.0
+            let z16: i8x16 = splat(0)
+            i = 0
+            while i < 256 {
+                store(dst_qs, base + i, z16)
+                i = i + 16
+            }
+            let mut j: i32 = 0
+            while j < 16 {
+                dst_bsums[b * 16 + j] = 0
+                j = j + 1
+            }
+        } else {
+            let d: f32 = amax / 127.0
+            dst_d[b] = d
+
+            // Pass 2: quantize f32 -> i8 via narrow_f32x4_i8
+            let inv_scale: f32 = 127.0 / amax
+            let v_inv: f32x4 = splat(inv_scale)
+            let v_min: f32x4 = splat(-127.0)
+            let v_max: f32x4 = splat(127.0)
+
+            i = 0
+            while i < 256 {
+                let v: f32x4 = load(src, base + i)
+                let scaled: f32x4 = v .* v_inv
+                let clamped: f32x4 = select(scaled .< v_min, v_min, select(scaled .> v_max, v_max, scaled))
+                let narrow: i8x16 = narrow_f32x4_i8(clamped)
+                store(dst_qs, base + i, narrow)
+                i = i + 4
+            }
+
+            // Pass 3: compute bsums
+            let mut g: i32 = 0
+            while g < 16 {
+                let gbase: i32 = base + g * 16
+                let mut sum: i32 = 0
+                let mut k: i32 = 0
+                while k < 16 {
+                    sum = sum + to_i32(dst_qs[gbase + k])
+                    k = k + 1
+                }
+                dst_bsums[b * 16 + g] = sum
+                g = g + 1
+            }
+        }
+
+        b = b + 1
+    }
+}

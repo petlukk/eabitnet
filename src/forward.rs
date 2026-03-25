@@ -2,6 +2,8 @@
 
 use crate::ffi;
 use crate::matmul::{embed_f16_lookup, i8_output_matmul_mt, ternary_matmul_mt, ternary_matmul_fused_pair, ternary_matmul_qkv};
+#[cfg(target_arch = "aarch64")]
+use crate::matmul::i8_output_matmul_speculative;
 use crate::model::BitNetModel;
 use crate::threadpool::ThreadPool;
 
@@ -310,6 +312,24 @@ impl InferenceState {
         }
 
         prof!(t_out, {
+            #[cfg(target_arch = "aarch64")]
+            {
+                if !model.embed_sketch.is_empty() {
+                    i8_output_matmul_speculative(
+                        &model.embed_weight_i8, &model.embed_row_scales,
+                        &model.embed_sketch, model.embed_sketch_dim,
+                        &self.x_norm, &mut self.logits,
+                        model.vocab_size, h, &self.pool,
+                    );
+                } else {
+                    i8_output_matmul_mt(
+                        &model.embed_weight_i8, &model.embed_row_scales,
+                        &self.x_norm, &mut self.logits,
+                        model.vocab_size, h, &self.pool,
+                    );
+                }
+            }
+            #[cfg(not(target_arch = "aarch64"))]
             i8_output_matmul_mt(
                 &model.embed_weight_i8, &model.embed_row_scales,
                 &self.x_norm, &mut self.logits,
