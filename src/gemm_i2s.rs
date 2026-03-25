@@ -106,6 +106,78 @@ pub(crate) fn i2s_gemm_mt(
     });
 }
 
+/// Fused gate+up+SquaredReLU GEMM for I2S.
+/// Output layout: out[t * out_dim + row] = squared_relu(gate[row]) * up[row]
+/// Note: gate and up have SEPARATE weight_scale values.
+pub(crate) fn i2s_fused_sqrelu_gemm_mt(
+    w_gate: *const u8, scale_gate: f32,
+    w_up: *const u8, scale_up: f32,
+    batch: &BatchI8,
+    out: &mut [f32],
+    out_dim: usize,
+    in_dim: usize,
+    pool: &ThreadPool,
+) {
+    let nt = batch.n_tokens;
+    let row_bytes = in_dim / 4;
+    let n_threads = pool.thread_count().min(out_dim / 4).max(1);
+    let wg = w_gate as usize;
+    let wu = w_up as usize;
+    let out_p = out.as_mut_ptr() as usize;
+    let qs: Vec<usize> = (0..nt).map(|t| batch.qs_ptr(t) as usize).collect();
+    let scales: Vec<f32> = (0..nt).map(|t| batch.scale(t)).collect();
+    let sums: Vec<i32> = (0..nt).map(|t| batch.sum(t)).collect();
+
+    pool.run(n_threads, |tid, n_thr| {
+        let chunk = ((out_dim + n_thr - 1) / n_thr + 3) & !3;
+        let start = tid * chunk;
+        let end = (start + chunk).min(out_dim);
+        if start >= end { return; }
+        let wg = wg as *const u8;
+        let wu = wu as *const u8;
+        let out = out_p as *mut f32;
+
+        let mut g_raw = [0i32; 4];
+        let mut u_raw = [0i32; 4];
+        let mut r = start;
+        unsafe {
+            while r + 4 <= end {
+                for t in 0..nt {
+                    let g_combined = (scales[t] / 127.0) * scale_gate;
+                    let u_combined = (scales[t] / 127.0) * scale_up;
+                    ffi::i2_dot_i8_4row_dual(
+                        wg.add(r * row_bytes), wg.add((r+1) * row_bytes),
+                        wg.add((r+2) * row_bytes), wg.add((r+3) * row_bytes),
+                        wu.add(r * row_bytes), wu.add((r+1) * row_bytes),
+                        wu.add((r+2) * row_bytes), wu.add((r+3) * row_bytes),
+                        qs[t] as *const i8, g_raw.as_mut_ptr(), u_raw.as_mut_ptr(),
+                        in_dim as i32,
+                    );
+                    let base = out.add(t * out_dim + r);
+                    for j in 0..4 {
+                        let g = (g_raw[j] - sums[t]) as f32 * g_combined;
+                        let u = (u_raw[j] - sums[t]) as f32 * u_combined;
+                        *base.add(j) = if g > 0.0 { g * g * u } else { 0.0 };
+                    }
+                }
+                r += 4;
+            }
+            while r < end {
+                for t in 0..nt {
+                    let g_combined = (scales[t] / 127.0) * scale_gate;
+                    let u_combined = (scales[t] / 127.0) * scale_up;
+                    let gv = ffi::i2_dot_i8(wg.add(r * row_bytes), qs[t] as *const i8, in_dim as i32);
+                    let uv = ffi::i2_dot_i8(wu.add(r * row_bytes), qs[t] as *const i8, in_dim as i32);
+                    let g = (gv - sums[t]) as f32 * g_combined;
+                    let u = (uv - sums[t]) as f32 * u_combined;
+                    *out.add(t * out_dim + r) = if g > 0.0 { g * g * u } else { 0.0 };
+                }
+                r += 1;
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 #[path = "gemm_i2s_tests.rs"]
 mod tests;

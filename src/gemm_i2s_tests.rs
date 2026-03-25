@@ -1,4 +1,4 @@
-use crate::gemm_i2s::{BatchI8, i2s_gemm_mt};
+use crate::gemm_i2s::{BatchI8, i2s_gemm_mt, i2s_fused_sqrelu_gemm_mt};
 use crate::matmul::ternary_matmul_mt;
 use crate::threadpool::ThreadPool;
 
@@ -83,5 +83,64 @@ fn i2s_gemm_matches_sequential() {
                 gemm_out[t * out_dim + r], seq_out[r],
             );
         }
+    }
+}
+
+#[test]
+fn i2s_fused_sqrelu_gemm_matches_sequential() {
+    let pool = ThreadPool::new();
+    let in_dim = 256;
+    let out_dim = 64;
+    let n_tokens = 4;
+    let scale_gate = 1.5f32;
+    let scale_up = 2.0f32;
+
+    // Different ternary patterns for gate and up
+    let gate_raw: Vec<i8> = (0..out_dim * in_dim)
+        .map(|i| (i % 3) as i8 - 1)
+        .collect();
+    let up_raw: Vec<i8> = (0..out_dim * in_dim)
+        .map(|i| ((i + 1) % 3) as i8 - 1)
+        .collect();
+    let gate_packed = pack_weight_matrix(&gate_raw, out_dim, in_dim);
+    let up_packed = pack_weight_matrix(&up_raw, out_dim, in_dim);
+
+    let xs: Vec<Vec<f32>> = (0..n_tokens)
+        .map(|t| (0..in_dim).map(|i| ((t * in_dim + i) as f32 - 500.0) / 500.0).collect())
+        .collect();
+
+    let mut batch = BatchI8::new(n_tokens, in_dim);
+    for t in 0..n_tokens {
+        batch.quantize(t, &xs[t]);
+    }
+
+    // Reference: separate GEMMs then fuse
+    let mut gate_out = vec![0.0f32; n_tokens * out_dim];
+    let mut up_out = vec![0.0f32; n_tokens * out_dim];
+    i2s_gemm_mt(gate_packed.as_ptr(), scale_gate, &batch, &mut gate_out, out_dim, in_dim, &pool);
+    i2s_gemm_mt(up_packed.as_ptr(), scale_up, &batch, &mut up_out, out_dim, in_dim, &pool);
+
+    let mut ref_out = vec![0.0f32; n_tokens * out_dim];
+    for i in 0..n_tokens * out_dim {
+        let g = gate_out[i];
+        ref_out[i] = if g > 0.0 { g * g * up_out[i] } else { 0.0 };
+    }
+
+    // Fused version
+    let mut fused_out = vec![0.0f32; n_tokens * out_dim];
+    i2s_fused_sqrelu_gemm_mt(
+        gate_packed.as_ptr(), scale_gate,
+        up_packed.as_ptr(), scale_up,
+        &batch, &mut fused_out, out_dim, in_dim, &pool,
+    );
+
+    for i in 0..n_tokens * out_dim {
+        let t = i / out_dim;
+        let r = i % out_dim;
+        assert!(
+            (fused_out[i] - ref_out[i]).abs() < 1e-3,
+            "mismatch at token {t} row {r}: fused={} ref={}",
+            fused_out[i], ref_out[i],
+        );
     }
 }
